@@ -10,15 +10,16 @@ import io.trino.spi.connector.Constraint;
 import io.trino.spi.function.table.ConnectorTableFunctionHandle;
 import lombok.extern.slf4j.Slf4j;
 
+import java.util.Objects;
+
 @Slf4j
-public class CachingSplitManager
+public final class CachingSplitManager
         implements ConnectorSplitManager {
 
     private final ConnectorSplitManager delegate;
 
-    public CachingSplitManager(
-            ConnectorSplitManager delegate) {
-        this.delegate = delegate;
+    public CachingSplitManager(ConnectorSplitManager delegate) {
+        this.delegate = Objects.requireNonNull(delegate, "delegate is null");
     }
 
     @Override
@@ -29,14 +30,14 @@ public class CachingSplitManager
             DynamicFilter dynamicFilter,
             Constraint constraint) {
 
-        ConnectorSplitSource splitSource = delegate.getSplits(
+        log.info("[SCENT SPI] Intercepted ConnectorSplitManager.getSplits(table)");
+
+        return delegate.getSplits(
                 transaction,
                 session,
                 table,
                 dynamicFilter,
                 constraint);
-        log.info("[SCENT SPI] Forwarded ConnectorSplitManager.getSplits(table)");
-        return splitSource;
     }
 
     @Override
@@ -45,11 +46,11 @@ public class CachingSplitManager
             ConnectorSession session,
             ConnectorTableFunctionHandle function) {
 
-        ConnectorSplitSource splitSource = delegate.getSplits(
+        log.info("[SCENT SPI] Intercepted ConnectorSplitManager.getSplits(function)");
+
+        return delegate.getSplits(
                 transaction,
                 session,
                 function);
-        log.info("[SCENT SPI] Forwarded ConnectorSplitManager.getSplits(function)");
-        return splitSource;
     }
 }

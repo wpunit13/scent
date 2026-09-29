@@ -11,6 +11,7 @@ import io.trino.spi.connector.DynamicFilter;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.List;
+import java.util.Objects;
 
 @Slf4j
 public class CachingPageSourceProvider
@@ -20,7 +21,7 @@ public class CachingPageSourceProvider
 
     public CachingPageSourceProvider(
             ConnectorPageSourceProvider delegate) {
-        this.delegate = delegate;
+        this.delegate = Objects.requireNonNull(delegate, "delegate is null");
     }
 
     @Override
@@ -32,14 +33,13 @@ public class CachingPageSourceProvider
             List<ColumnHandle> columns,
             DynamicFilter dynamicFilter) {
 
-        ConnectorPageSource pageSource = delegate.createPageSource(
+        log.info("[SCENT SPI] Forwarded ConnectorPageSourceProvider.createPageSource");
+        return delegate.createPageSource(
                 transaction,
                 session,
                 split,
                 table,
                 columns,
                 dynamicFilter);
-        log.info("[SCENT SPI] Forwarded ConnectorPageSourceProvider.createPageSource");
-        return pageSource;
     }
 }

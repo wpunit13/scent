@@ -1,11 +1,11 @@
 package com.scent.trino.cache;
 
-import io.airlift.log.Logger;
 import io.trino.spi.connector.Connector;
 import io.trino.spi.connector.ConnectorPageSourceProvider;
 import io.trino.spi.connector.ConnectorPageSourceProviderFactory;
 import io.trino.spi.connector.ConnectorSplitManager;
 import io.trino.spi.connector.ConnectorMetadata;
+import lombok.extern.slf4j.Slf4j;
 
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
@@ -13,9 +13,8 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.Objects;
 
+@Slf4j
 public final class CachingConnector implements InvocationHandler {
-
-    private static final Logger LOG = Logger.get(CachingConnector.class);
 
     private final Connector delegate;
 
@@ -33,26 +32,29 @@ public final class CachingConnector implements InvocationHandler {
     @Override
     public Object invoke(Object proxy, Method method, Object[] arguments)
             throws Throwable {
-        Object result;
         try {
-            result = method.invoke(delegate, arguments);
+            Object result = method.invoke(delegate, arguments);
+            if (method.getDeclaringClass() != Object.class) {
+                log.info("[SCENT SPI] Forwarded Connector.{}", method.getName());
+            }
+            return wrapResult(method, result);
         }
-        catch (InvocationTargetException exception) {
-            throw exception.getCause();
+        catch (InvocationTargetException e) {
+            throw e.getCause();
         }
-        if (method.getDeclaringClass() != Object.class) {
-            LOG.info("[SCENT SPI] Forwarded Connector.%s", method.getName());
-        }
+    }
 
+    private Object wrapResult(Method method, Object result) {
         return switch (method.getName()) {
             case "getMetadata" -> CachingMetadata.wrap((ConnectorMetadata) result);
             case "getSplitManager" -> new CachingSplitManager((ConnectorSplitManager) result);
             case "getPageSourceProvider" -> new CachingPageSourceProvider((ConnectorPageSourceProvider) result);
-            case "getPageSourceProviderFactory" -> {
-                ConnectorPageSourceProviderFactory factory = (ConnectorPageSourceProviderFactory) result;
+            case "getPageSourceProviderFactory" -> {ConnectorPageSourceProviderFactory factory = (ConnectorPageSourceProviderFactory) result;
                 yield (ConnectorPageSourceProviderFactory) () ->
-                        new CachingPageSourceProvider(factory.createPageSourceProvider());
+                        new CachingPageSourceProvider(
+                                factory.createPageSourceProvider());
             }
+
             default -> result;
         };
     }
