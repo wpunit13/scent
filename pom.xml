@@ -20,7 +20,7 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <lombok.version>1.18.48</lombok.version>
         <maven.compiler.release>24</maven.compiler.release>
-        <trino.version>476</trino.version>
+        <trino.version>483</trino.version>
     </properties>
 
     <dependencyManagement>
@@ -76,36 +76,25 @@
             <scope>provided</scope>
         </dependency>
 
-        <!-- Bundled into your plugin -->
+        <!-- @Slf4j-generated code needs the API at compile and runtime, and a provider
+             at runtime: the plugin classloader does not see the server's classpath, so
+             both jars must be installed into the plugin directory. jdk14 routes to JUL,
+             which Trino's log manager configures. -->
         <dependency>
-            <groupId>io.trino</groupId>
-            <artifactId>trino-plugin-toolkit</artifactId>
-            <version>${trino.version}</version>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
         </dependency>
 
         <dependency>
-            <groupId>io.trino</groupId>
-            <artifactId>trino-postgresql</artifactId>
-            <version>${trino.version}</version>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-jdk14</artifactId>
+            <version>2.0.18</version>
+            <scope>runtime</scope>
         </dependency>
 
-        <dependency>
-            <groupId>io.trino</groupId>
-            <artifactId>trino-oracle</artifactId>
-            <version>${trino.version}</version>
-        </dependency>
-
-        <dependency>
-            <groupId>io.trino</groupId>
-            <artifactId>trino-bigquery</artifactId>
-            <version>${trino.version}</version>
-        </dependency>
-
-        <dependency>
-            <groupId>io.airlift</groupId>
-            <artifactId>configuration</artifactId>
-        </dependency>
-
+        <!-- Compile-time only: supplies the @Slf4j annotation. check-spi-dependencies
+             rejects provided scope for non-SPI deps, so it stays compile-scoped and is
+             excluded from the installed dependency set via -DexcludeArtifactIds. -->
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
@@ -114,6 +103,14 @@
     </dependencies>
 
     <build>
+        <resources>
+            <!-- Bakes ${trino.version} into scent-trino-plugin.properties for the runtime version guard -->
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>true</filtering>
+            </resource>
+        </resources>
+
         <plugins>
 
             <!-- Trino plugin packaging -->

@@ -1,7 +1,7 @@
 package com.scent.trino.cache;
 
+import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ConnectorSession;
-import io.trino.spi.connector.DynamicFilter;
 import io.trino.spi.connector.ConnectorSplitManager;
 import io.trino.spi.connector.ConnectorSplitSource;
 import io.trino.spi.connector.ConnectorTableHandle;
@@ -11,6 +11,7 @@ import io.trino.spi.function.table.ConnectorTableFunctionHandle;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.Objects;
+import java.util.Set;
 
 @Slf4j
 public final class CachingSplitManager
@@ -27,7 +28,7 @@ public final class CachingSplitManager
             ConnectorTransactionHandle transaction,
             ConnectorSession session,
             ConnectorTableHandle table,
-            DynamicFilter dynamicFilter,
+            Set<ColumnHandle> columns,
             Constraint constraint) {
 
         log.info("[SCENT SPI] Intercepted ConnectorSplitManager.getSplits(table)");
@@ -36,7 +37,7 @@ public final class CachingSplitManager
                 transaction,
                 session,
                 table,
-                dynamicFilter,
+                columns,
                 constraint);
     }
 
