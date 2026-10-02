@@ -23,7 +23,7 @@ public class CachingConnectorFactory
 
     @Override
     public String getName() {
-        return "cache-wrapper";
+        return "cache_wrapper";
     }
 
     @Override
