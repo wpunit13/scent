@@ -133,7 +133,7 @@ The layout ends up as:
 ```text
 /usr/lib/trino/plugin/scent/
 |-- scent-trino-plugin-0.1.0-SNAPSHOT.jar
-|-- scent-trino-plugin-0.1.0-SNAPSHOT-services.jar   # registers cache-wrapper
+|-- scent-trino-plugin-0.1.0-SNAPSHOT-services.jar   # registers cache_wrapper
 |-- slf4j-api-2.0.18.jar                             # SCENT's runtime deps (dependency:copy-dependencies)
 |-- slf4j-jdk14-2.0.18.jar                           # SLF4J provider: routes plugin logs to Trino's log
 |-- io.trino_trino-postgresql-483.jar                # copied from the cluster's own plugin dir
@@ -144,7 +144,7 @@ The layout ends up as:
 Two rules:
 
 - **Exclude the delegate `-services.jar` files.** Including one would register the delegate as a top-level connector and collide with its own plugin directory at startup (Trino rejects duplicate connector registration). The `! -name '*-services.jar'` in the command above handles this.
-- **Install SCENT in exactly one plugin directory.** Do not copy the SCENT jar into a delegate's plugin directory (`/plugin/postgresql/`, etc.) — each directory would register `cache-wrapper`, and duplicate connector registration is fatal.
+- **Install SCENT in exactly one plugin directory.** Do not copy the SCENT jar into a delegate's plugin directory (`/plugin/postgresql/`, etc.) — each directory would register `cache_wrapper`, and duplicate connector registration is fatal.
 
 **Why copying the delegate main jars does not double-register the delegate.** Trino registers a connector only when it finds a `META-INF/services/io.trino.spi.Plugin` descriptor on a plugin directory's classloader (`ServiceLoader` in `PluginManager`); a second registration of the same connector name fails startup with `Connector 'X' is already registered`. Trino's own packaging (`trino-maven-plugin`) puts those descriptors in the `-services.jar` and keeps the main jar free of them, so the copied main jars only put the delegate's *classes* on SCENT's classloader — `oracle` is still registered exactly once, from its own plugin directory.
 
@@ -162,7 +162,7 @@ Delegate plugins elsewhere on the cluster are unaffected. A delegate whose jars 
 
 ```properties
 # /etc/trino/catalog/cached_pg.properties
-connector.name=cache-wrapper
+connector.name=cache_wrapper
 delegate.connector.name=postgresql
 
 # Upstream connector credentials (passed through to the delegate)

@@ -17,16 +17,20 @@ import java.util.Objects;
 public final class CachingConnector implements InvocationHandler {
 
     private final Connector delegate;
+    private final String partitionColumn;
+    private final InMemorySliceStore sliceStore;
 
-    public CachingConnector(Connector delegate) {
+    public CachingConnector(Connector delegate, String partitionColumn, InMemorySliceStore sliceStore) {
         this.delegate = Objects.requireNonNull(delegate, "delegate is null");
+        this.partitionColumn = Objects.requireNonNull(partitionColumn, "partitionColumn is null");
+        this.sliceStore = Objects.requireNonNull(sliceStore, "sliceStore is null");
     }
 
-    public static Connector wrap(Connector delegate) {
+    public static Connector wrap(Connector delegate, String partitionColumn, InMemorySliceStore sliceStore) {
         return (Connector) Proxy.newProxyInstance(
                 Connector.class.getClassLoader(),
                 new Class<?>[] {Connector.class},
-                new CachingConnector(delegate));
+                new CachingConnector(delegate, partitionColumn, sliceStore));
     }
 
     @Override
@@ -35,24 +39,25 @@ public final class CachingConnector implements InvocationHandler {
         try {
             Object result = method.invoke(delegate, arguments);
             if (method.getDeclaringClass() != Object.class) {
-                log.info("[SCENT SPI] Forwarded Connector.{}", method.getName());
+                log.debug("[SCENT SPI] Forwarded Connector.{}", method.getName());
             }
             return wrapResult(method, result);
         }
         catch (InvocationTargetException e) {
-            throw e.getCause();
+            throw e.getCause() != null ? e.getCause() : e;
         }
     }
 
     private Object wrapResult(Method method, Object result) {
         return switch (method.getName()) {
-            case "getMetadata" -> CachingMetadata.wrap((ConnectorMetadata) result);
+            case "getMetadata" -> CachingMetadata.wrap((ConnectorMetadata) result, partitionColumn);
             case "getSplitManager" -> new CachingSplitManager((ConnectorSplitManager) result);
-            case "getPageSourceProvider" -> new CachingPageSourceProvider((ConnectorPageSourceProvider) result);
+            case "getPageSourceProvider" -> new CachingPageSourceProvider((ConnectorPageSourceProvider) result, sliceStore);
             case "getPageSourceProviderFactory" -> {ConnectorPageSourceProviderFactory factory = (ConnectorPageSourceProviderFactory) result;
                 yield (ConnectorPageSourceProviderFactory) () ->
                         new CachingPageSourceProvider(
-                                factory.createPageSourceProvider());
+                                factory.createPageSourceProvider(),
+                                sliceStore);
             }
 
             default -> result;

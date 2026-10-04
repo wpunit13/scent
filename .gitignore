@@ -1,3 +1,5 @@
 /target/
 /.idea/
 /docs
+/e2e/plugin/
+/e2e/STATE.md

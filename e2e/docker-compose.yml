@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: test
+    volumes:
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test -d test"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  trino-coordinator:
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile
+    image: scent-trino:483
+    volumes:
+      - ./etc/coordinator:/etc/trino:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  trino-worker:
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile
+    image: scent-trino:483
+    volumes:
+      - ./etc/worker:/etc/trino:ro
+    depends_on:
+      - trino-coordinator
+      - postgres

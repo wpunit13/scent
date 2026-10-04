@@ -39,10 +39,19 @@ public class CachingConnectorFactory
             throw new IllegalArgumentException("Missing required configuration: delegate.connector.name");
         }
 
+        String partitionColumn = config.get("cache.partition-column");
+        if (partitionColumn == null || partitionColumn.isBlank()) {
+            throw new IllegalArgumentException("Missing required configuration: cache.partition-column");
+        }
+
+        long cacheMaxBytes = config.containsKey("cache.max-bytes")
+                ? Long.parseLong(config.get("cache.max-bytes"))
+                : 256L * 1024 * 1024;
+
         ConnectorFactory delegateFactory = delegateResolver.resolve(delegateName);
 
         Map<String, String> delegateConfig = new HashMap<>(config);
-        delegateConfig.remove("delegate.connector.name");
+        delegateConfig.keySet().removeIf(key -> key.startsWith("cache.") || key.startsWith("delegate."));
 
         Connector delegateConnector =
                 delegateFactory.create(
@@ -50,7 +59,7 @@ public class CachingConnectorFactory
                         delegateConfig,
                         context);
 
-        return CachingConnector.wrap(delegateConnector);
+        return CachingConnector.wrap(delegateConnector, partitionColumn, new InMemorySliceStore(cacheMaxBytes));
     }
 
     /**
