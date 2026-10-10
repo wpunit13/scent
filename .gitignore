@@ -2,4 +2,5 @@
 /.idea/
 /docs
 /e2e/plugin/
+/e2e/cache/
 /e2e/STATE.md

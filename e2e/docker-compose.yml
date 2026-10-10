@@ -20,6 +20,7 @@ services:
     image: scent-trino:483
     volumes:
       - ./etc/coordinator:/etc/trino:ro
+      - ./cache:/tmp/scent-cache
     ports:
       - "8080:8080"
     depends_on:
@@ -33,6 +34,7 @@ services:
     image: scent-trino:483
     volumes:
       - ./etc/worker:/etc/trino:ro
+      - ./cache:/tmp/scent-cache
     depends_on:
       - trino-coordinator
       - postgres

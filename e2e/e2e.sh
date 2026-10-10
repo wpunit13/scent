@@ -20,6 +20,27 @@ echo "== docker build + up"
 docker compose build 2>&1 | tail -1
 docker compose up -d --force-recreate
 
+echo "== verifying shared cache volume mount"
+worker_ids=$(docker compose ps -q trino-worker)
+[ -n "$worker_ids" ] || { echo "FAIL: no worker container found"; exit 1; }
+shared_cache_source=""
+while IFS= read -r worker_id; do
+  [ -n "$worker_id" ] || continue
+  mount_info=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/tmp/scent-cache"}}{{.Type}} {{.Source}}{{end}}{{end}}' "$worker_id")
+  echo "worker $worker_id cache mount: $mount_info"
+  [ "${mount_info%% *}" = "bind" ] || { echo "FAIL: /tmp/scent-cache is not a bind mount"; exit 1; }
+  cache_source=${mount_info#* }
+  if [ -z "$shared_cache_source" ]; then
+    shared_cache_source="$cache_source"
+  elif [ "$cache_source" != "$shared_cache_source" ]; then
+    echo "FAIL: workers are mounted to different cache directories"
+    exit 1
+  fi
+done <<EOF
+$worker_ids
+EOF
+echo "all workers share host cache directory: $shared_cache_source"
+
 echo "== waiting for coordinator"
 ready=0
 for _ in $(seq 1 60); do
@@ -103,6 +124,16 @@ check "0-col count(*)=100"        100     "$(scalar "SELECT count(*) FROM scent.
 
 check "no-partition passthrough"  300     "$(scalar 'SELECT count(*) FROM scent.public.metrics')"
 pt=$(docker compose logs trino-coordinator 2>/dev/null | grep -c 'getSplits passthrough'); [ "$pt" -ge 1 ] && pt=1; check "passthrough logged" 1 "$pt"
+
+echo "== Parquet files in the shared cache mount"
+find ./cache -type f -name '*.parquet' -exec ls -lh {} \;
+while IFS= read -r worker_id; do
+  [ -n "$worker_id" ] || continue
+  echo "worker $worker_id:"
+  docker exec "$worker_id" sh -c 'find /tmp/scent-cache -type f -name "*.parquet" -exec ls -lh {} \;'
+done <<EOF
+$worker_ids
+EOF
 
 echo
 echo "== $pass passed, $fail failed"
