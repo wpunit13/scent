@@ -22,16 +22,13 @@ import java.util.Objects;
 import java.util.Optional;
 
 @Slf4j
-public class CachingPageSourceProvider
-        implements ConnectorPageSourceProvider
-{
+public class CachingPageSourceProvider implements ConnectorPageSourceProvider {
     private final ConnectorPageSourceProvider delegate;
     private final InMemorySliceStore sliceStore;
 
     public CachingPageSourceProvider(
             ConnectorPageSourceProvider delegate,
-            InMemorySliceStore sliceStore)
-    {
+            InMemorySliceStore sliceStore) {
         this.delegate = Objects.requireNonNull(delegate, "delegate is null");
         this.sliceStore = Objects.requireNonNull(sliceStore, "sliceStore is null");
     }
@@ -44,8 +41,7 @@ public class CachingPageSourceProvider
             ConnectorTableHandle table,
             Optional<ConnectorTableCredentials> tableCredentials,
             List<ColumnHandle> columns,
-            DynamicFilter dynamicFilter)
-    {
+            DynamicFilter dynamicFilter) {
         if (split instanceof CachingSplit caching) {
             int[] channels = channelsFor(columns, caching);
             if (channels != null) {
@@ -93,8 +89,7 @@ public class CachingPageSourceProvider
      * column is unknown to the layout — the read then degrades to the delegate (and the
      * populate path refreshes the slice).
      */
-    private static int[] channelsFor(List<ColumnHandle> columns, CachingSplit split)
-    {
+    private static int[] channelsFor(List<ColumnHandle> columns, CachingSplit split) {
         int[] channels = new int[columns.size()];
         for (int i = 0; i < columns.size(); i++) {
             channels[i] = split.cachedChannelIndex(columns.get(i));
@@ -109,15 +104,13 @@ public class CachingPageSourceProvider
      * Projects cached pages to the requested channels. Blocks are shared, never copied:
      * Trino blocks are immutable once built.
      */
-    private static List<Page> project(List<Page> pages, int[] channels)
-    {
+    private static List<Page> project(List<Page> pages, int[] channels) {
         return pages.stream()
                 .map(page -> projectPage(page, channels))
                 .toList();
     }
 
-    private static Page projectPage(Page page, int[] channels)
-    {
+    private static Page projectPage(Page page, int[] channels) {
         if (channels.length == 0) {
             return new Page(page.getPositionCount());
         }
@@ -128,8 +121,7 @@ public class CachingPageSourceProvider
         return new Page(page.getPositionCount(), blocks);
     }
 
-    private static ConnectorTableHandle unwrap(ConnectorTableHandle table)
-    {
+    private static ConnectorTableHandle unwrap(ConnectorTableHandle table) {
         return table instanceof CachingTableHandle caching ? caching.getDelegateHandle() : table;
     }
 
@@ -138,9 +130,7 @@ public class CachingPageSourceProvider
      * buffering the raw slice. The slice is published only on clean exhaustion; an early close
      * (query cancel, error, limit) discards the partial buffer (C4).
      */
-    private static final class PopulatingPageSource
-            implements ConnectorPageSource
-    {
+    private static final class PopulatingPageSource implements ConnectorPageSource {
         private final ConnectorPageSource delegate;
         private final CachingSplit split;
         private final int[] channels;
@@ -154,8 +144,7 @@ public class CachingPageSourceProvider
                 ConnectorPageSource delegate,
                 CachingSplit split,
                 int[] channels,
-                InMemorySliceStore sliceStore)
-        {
+                InMemorySliceStore sliceStore) {
             this.delegate = delegate;
             this.split = split;
             this.channels = channels;
@@ -163,8 +152,7 @@ public class CachingPageSourceProvider
         }
 
         @Override
-        public SourcePage getNextSourcePage()
-        {
+        public SourcePage getNextSourcePage() {
             SourcePage raw = delegate.getNextSourcePage();
             if (raw == null) {
                 publishIfComplete();
@@ -201,9 +189,7 @@ public class CachingPageSourceProvider
         }
 
         @Override
-        public void close()
-                throws IOException
-        {
+        public void close() throws IOException {
             // The engine may stop at isFinished() without polling the terminal null,
             // so a completed buffer can publish here too; publishIfComplete is idempotent.
             publishIfComplete();
@@ -217,11 +203,10 @@ public class CachingPageSourceProvider
          * The delegate reports finished only after every page was consumed, so the buffer
          * is complete exactly when this succeeds.
          */
-        private void publishIfComplete()
-        {
+        private void publishIfComplete() {
             if (!published && !overCap && delegate.isFinished()) {
                 published = true;
-                sliceStore.put(split.getSliceKey(), buffer);
+                sliceStore.put(split.getSliceKey(), buffer, split.cachedChannelNames(), split.cachedChannelTypes());
                 log.debug("[SCENT] published slice {} ({} bytes)", split.getSliceKey(), bufferedBytes);
             }
         }

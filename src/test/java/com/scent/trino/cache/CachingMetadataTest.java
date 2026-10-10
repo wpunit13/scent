@@ -7,11 +7,13 @@ import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTableVersion;
 import io.trino.spi.connector.Constraint;
 import io.trino.spi.connector.ConstraintApplicationResult;
+import io.trino.spi.connector.ColumnMetadata;
 import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.expression.Constant;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.type.BigintType;
+import io.trino.spi.type.VarcharType;
 import org.junit.jupiter.api.Test;
 
 import java.util.Map;
@@ -58,6 +60,14 @@ class CachingMetadataTest {
         }
 
         @Override
+        public ColumnMetadata getColumnMetadata(ConnectorSession session, ConnectorTableHandle tableHandle, ColumnHandle columnHandle) {
+            if (columnHandle == columns.get(PARTITION_COLUMN)) {
+                return ColumnMetadata.builder().setName(PARTITION_COLUMN).setType(BigintType.BIGINT).build();
+            }
+            return ColumnMetadata.builder().setName("other").setType(VarcharType.VARCHAR).build();
+        }
+
+        @Override
         public SchemaTableName getTableName(ConnectorSession session, ConnectorTableHandle tableHandle) {
             return tableHandle == handle ? new SchemaTableName("schema", "table") : null;
         }
@@ -83,7 +93,12 @@ class CachingMetadataTest {
 
     private ConnectorMetadata metadata() {
         stub.columns = Map.of(PARTITION_COLUMN, partitionHandle, "other", otherHandle);
-        return CachingMetadata.wrap(stub, PARTITION_COLUMN);
+        return CachingMetadata.wrap(stub, PARTITION_COLUMN, false);
+    }
+
+    private ConnectorMetadata metadataWithColumnTypes() {
+        stub.columns = Map.of(PARTITION_COLUMN, partitionHandle, "other", otherHandle);
+        return CachingMetadata.wrap(stub, PARTITION_COLUMN, true);
     }
 
     private CachingTableHandle tableHandle(ConnectorMetadata metadata) {
@@ -121,8 +136,19 @@ class CachingMetadataTest {
     }
 
     @Test
+    void getColumnHandlesCapturesColumnTypesWhenEnabled() {
+        ConnectorMetadata metadata = metadataWithColumnTypes();
+        CachingTableHandle wrapped = tableHandle(metadata);
+
+        metadata.getColumnHandles(null, wrapped);
+
+        assertSame(stub.handle, stub.columnHandlesHandle);
+        assertEquals(Map.of(PARTITION_COLUMN, "bigint", "other", "varchar"), wrapped.getColumnTypes());
+    }
+
+    @Test
     void applyFilterSplitsPartitionDomain() {
-        ConnectorMetadata metadata = metadata();
+        ConnectorMetadata metadata = metadataWithColumnTypes();
         stub.filteredHandle = new ConnectorTableHandle() {};
         stub.filterResult = Optional.of(new ConstraintApplicationResult<>(
                 stub.filteredHandle, TupleDomain.all(), Constant.TRUE, false));
@@ -146,6 +172,7 @@ class CachingMetadataTest {
         assertSame(stub.filteredHandle, cached.getDelegateHandle());
         assertEquals(withColumnDomains(Map.of(partitionHandle, PART)), cached.getPartitionDomain());
         assertEquals(wrapped.getColumnHandles(), cached.getColumnHandles());
+        assertEquals(wrapped.getColumnTypes(), cached.getColumnTypes());
         // Remaining filter carries only the non-partition domains
         assertEquals(withColumnDomains(Map.of(otherHandle, OTHER)), result.get().getRemainingFilter());
         assertFalse(result.get().isPrecalculateStatistics());

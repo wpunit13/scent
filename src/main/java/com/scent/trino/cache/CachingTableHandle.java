@@ -17,25 +17,25 @@ import static java.util.Objects.requireNonNullElse;
  * the partition predicate that defines the cached slice, and the delegate's column handles
  * (attached by getColumnHandles interception) which fix the channel order of cached pages.
  */
-public final class CachingTableHandle
-        implements ConnectorTableHandle
-{
+public final class CachingTableHandle implements ConnectorTableHandle {
     private final ConnectorTableHandle delegateHandle;
     private final SchemaTableName schemaTableName;
     private final TupleDomain<ColumnHandle> partitionDomain;
     private Map<String, ColumnHandle> columnHandles;
+    private Map<String, String> columnTypes;
 
     @JsonCreator
     public CachingTableHandle(
             @JsonProperty("delegateHandle") ConnectorTableHandle delegateHandle,
             @JsonProperty("schemaTableName") SchemaTableName schemaTableName,
             @JsonProperty("partitionDomain") TupleDomain<ColumnHandle> partitionDomain,
-            @JsonProperty("columnHandles") Map<String, ColumnHandle> columnHandles)
-    {
+            @JsonProperty("columnHandles") Map<String, ColumnHandle> columnHandles,
+            @JsonProperty("columnTypes") Map<String, String> columnTypes) {
         this.delegateHandle = Objects.requireNonNull(delegateHandle, "delegateHandle is null");
         this.schemaTableName = schemaTableName;
         this.partitionDomain = requireNonNullElse(partitionDomain, TupleDomain.all());
         this.columnHandles = columnHandles;
+        this.columnTypes = columnTypes;
     }
 
     @JsonProperty
@@ -62,13 +62,24 @@ public final class CachingTableHandle
         return columnHandles;
     }
 
+    @JsonProperty
+    public synchronized Map<String, String> getColumnTypes()
+    {
+        return columnTypes;
+    }
+
     /**
      * Columns are learned exactly once, from the delegate's getColumnHandles; first write wins.
      */
-    public synchronized void attachColumns(Map<String, ColumnHandle> columnHandles)
-    {
+    public synchronized void attachColumns(Map<String, ColumnHandle> columnHandles) {
         if (columnHandles != null && this.columnHandles == null) {
             this.columnHandles = Map.copyOf(columnHandles);
+        }
+    }
+
+    public synchronized void attachColumnTypes(Map<String, String> columnTypes) {
+        if (columnTypes != null && this.columnTypes == null) {
+            this.columnTypes = Map.copyOf(columnTypes);
         }
     }
 

@@ -25,24 +25,22 @@ import java.util.Set;
 import static io.trino.spi.predicate.TupleDomain.withColumnDomains;
 
 @Slf4j
-public final class CachingMetadata
-        implements InvocationHandler
-{
+public final class CachingMetadata implements InvocationHandler {
     private final ConnectorMetadata delegate;
     private final String partitionColumn;
+    private final boolean captureColumnTypes;
 
-    public CachingMetadata(ConnectorMetadata delegate, String partitionColumn)
-    {
+    public CachingMetadata(ConnectorMetadata delegate, String partitionColumn, boolean captureColumnTypes) {
         this.delegate = Objects.requireNonNull(delegate, "delegate is null");
         this.partitionColumn = Objects.requireNonNull(partitionColumn, "partitionColumn is null");
+        this.captureColumnTypes = captureColumnTypes;
     }
 
-    public static ConnectorMetadata wrap(ConnectorMetadata delegate, String partitionColumn)
-    {
+    public static ConnectorMetadata wrap(ConnectorMetadata delegate, String partitionColumn, boolean captureColumnTypes) {
         return (ConnectorMetadata) Proxy.newProxyInstance(
                 ConnectorMetadata.class.getClassLoader(),
                 new Class<?>[] {ConnectorMetadata.class},
-                new CachingMetadata(delegate, partitionColumn));
+                new CachingMetadata(delegate, partitionColumn, captureColumnTypes));
     }
 
     /**
@@ -61,9 +59,7 @@ public final class CachingMetadata
             "applyTableScanRedirect");
 
     @Override
-    public Object invoke(Object proxy, Method method, Object[] arguments)
-            throws Throwable
-    {
+    public Object invoke(Object proxy, Method method, Object[] arguments) throws Throwable {
         try {
             return switch (method.getName()) {
                 case "getTableHandle" -> getTableHandle(method, arguments);
@@ -74,8 +70,10 @@ public final class CachingMetadata
                             && arguments[1] instanceof CachingTableHandle) {
                         // Optional<...>-returning pushdown hooks: decline so Trino plans the
                         // rewrite above the scan instead of folding it into the delegate handle.
+                        log.debug("[SCENT SPI] Declining ConnectorMetadata.{} to preserve the caching table handle", method.getName());
                         yield Optional.empty();
                     }
+                    log.debug("[SCENT SPI] Forwarding ConnectorMetadata.{} to the delegate", method.getName());
                     yield method.invoke(delegate, unwrap(arguments));
                 }
             };
@@ -83,16 +81,9 @@ public final class CachingMetadata
         catch (InvocationTargetException exception) {
             throw exception.getCause() != null ? exception.getCause() : exception;
         }
-        finally {
-            if (method.getDeclaringClass() != Object.class) {
-                log.debug("[SCENT SPI] Forwarded ConnectorMetadata.{}", method.getName());
-            }
-        }
     }
 
-    private Object getTableHandle(Method method, Object[] arguments)
-            throws Exception
-    {
+    private Object getTableHandle(Method method, Object[] arguments) throws Exception {
         Object result = method.invoke(delegate, arguments);
         if (result == null) {
             return null;
@@ -101,26 +92,31 @@ public final class CachingMetadata
                 (ConnectorTableHandle) result,
                 (SchemaTableName) arguments[1],
                 TupleDomain.all(),
+                null,
                 null);
     }
 
-    private Object getColumnHandles(Method method, Object[] arguments)
-            throws Exception
-    {
+    private Object getColumnHandles(Method method, Object[] arguments) throws Exception {
         CachingTableHandle caching = arguments[1] instanceof CachingTableHandle handle ? handle : null;
         Object result = method.invoke(delegate, unwrap(arguments));
         if (caching != null && result != null) {
             @SuppressWarnings("unchecked")
             Map<String, ColumnHandle> columns = (Map<String, ColumnHandle>) result;
             caching.attachColumns(columns);
+            if (captureColumnTypes) {
+                ConnectorSession session = (ConnectorSession) arguments[0];
+                Map<String, String> types = new HashMap<>();
+                columns.forEach((name, column) -> types.put(
+                        name,
+                        delegate.getColumnMetadata(session, caching.getDelegateHandle(), column).getType().getTypeId().getId()));
+                caching.attachColumnTypes(types);
+            }
         }
         return result;
     }
 
     @SuppressWarnings("unchecked")
-    private Object applyFilter(Method method, Object[] arguments)
-            throws Exception
-    {
+    private Object applyFilter(Method method, Object[] arguments) throws Exception {
         if (!(arguments[1] instanceof CachingTableHandle caching)) {
             return method.invoke(delegate, arguments);
         }
@@ -163,7 +159,8 @@ public final class CachingMetadata
                 result.get().getHandle(),
                 caching.getSchemaTableName(),
                 merged,
-                caching.getColumnHandles());
+                caching.getColumnHandles(),
+                caching.getColumnTypes());
         return Optional.of(new ConstraintApplicationResult<>(
                 wrapped,
                 withoutPartitionColumn(summary, partitionHandle),
@@ -172,9 +169,7 @@ public final class CachingMetadata
                 false));
     }
 
-    private Object forwardWithFullConstraint(Method method, Object[] arguments, CachingTableHandle caching)
-            throws Exception
-    {
+    private Object forwardWithFullConstraint(Method method, Object[] arguments, CachingTableHandle caching) throws Exception {
         Optional<ConstraintApplicationResult<ConnectorTableHandle>> result =
                 (Optional<ConstraintApplicationResult<ConnectorTableHandle>>) method.invoke(
                         delegate,
@@ -188,7 +183,8 @@ public final class CachingMetadata
                 result.get().getHandle(),
                 caching.getSchemaTableName(),
                 caching.getPartitionDomain(),
-                caching.getColumnHandles());
+                caching.getColumnHandles(),
+                caching.getColumnTypes());
         return Optional.of(new ConstraintApplicationResult<>(
                 wrapped,
                 result.get().getRemainingFilter(),
@@ -196,9 +192,7 @@ public final class CachingMetadata
                 result.get().isPrecalculateStatistics()));
     }
 
-    private ColumnHandle resolvePartitionHandle(ConnectorSession session, CachingTableHandle caching)
-            throws Exception
-    {
+    private ColumnHandle resolvePartitionHandle(ConnectorSession session, CachingTableHandle caching) {
         Map<String, ColumnHandle> columns = delegate.getColumnHandles(session, caching.getDelegateHandle());
         return columns.get(partitionColumn);
     }
@@ -207,8 +201,7 @@ public final class CachingMetadata
      * The partition column's slice of the summary, or all() when the partition column carries
      * no predicate (unknown column, missing from this table, or simply unconstrained).
      */
-    private static TupleDomain<ColumnHandle> partitionDomainFor(TupleDomain<ColumnHandle> summary, ColumnHandle partitionHandle)
-    {
+    private static TupleDomain<ColumnHandle> partitionDomainFor(TupleDomain<ColumnHandle> summary, ColumnHandle partitionHandle) {
         if (partitionHandle == null) {
             return TupleDomain.all();
         }
@@ -218,8 +211,7 @@ public final class CachingMetadata
                 .orElseGet(TupleDomain::all);
     }
 
-    private static TupleDomain<ColumnHandle> withoutPartitionColumn(TupleDomain<ColumnHandle> summary, ColumnHandle partitionHandle)
-    {
+    private static TupleDomain<ColumnHandle> withoutPartitionColumn(TupleDomain<ColumnHandle> summary, ColumnHandle partitionHandle) {
         Map<ColumnHandle, Domain> domains = summary.getDomains().orElseThrow();
         Map<ColumnHandle, Domain> remaining = new HashMap<>(domains);
         remaining.remove(partitionHandle);
@@ -229,8 +221,7 @@ public final class CachingMetadata
         return withColumnDomains(remaining);
     }
 
-    private static Object[] unwrap(Object[] arguments)
-    {
+    private static Object[] unwrap(Object[] arguments) {
         if (arguments == null) {
             return null;
         }

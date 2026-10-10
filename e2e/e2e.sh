@@ -28,6 +28,9 @@ for _ in $(seq 1 60); do
 done
 [ "$ready" = 1 ] || { echo "FAIL: coordinator not ready"; exit 1; }
 
+echo "== ensuring join tables exist in postgres"
+docker compose exec -T postgres psql -U test -d test -v ON_ERROR_STOP=1 < postgres-init.sql
+
 echo "== waiting for worker (first query)"
 worker=0
 for _ in $(seq 1 30); do
@@ -44,11 +47,56 @@ scalar() { python3 run-query.py "$1" 2>/dev/null | sed -n '2p'; }
 
 echo "== verification"
 check "passthrough count(*)=300"  300     "$(scalar 'SELECT count(*) FROM scent.public.metrics')"
+
+check "populate us-west partition" 100 "$(scalar "SELECT count(*) FROM scent.public.metrics WHERE region='us-west'")"
+west_parquet_files=$(docker compose exec -T trino-worker sh -c "find /tmp/scent-cache -type f -name '*us-west*.parquet' -print | grep -c . || true" | tr -d '\r')
+[ "${west_parquet_files:-0}" -ge 1 ] && west_parquet_files=1 || west_parquet_files=0
+check "us-west Parquet slice created" 1 "$west_parquet_files"
+
+masked_query="SELECT region,
+  day,
+  CASE WHEN value IS NULL THEN NULL ELSE 0.0 END AS masked_value
+FROM scent.public.metrics
+WHERE region = 'us-west'
+LIMIT 10"
+masked_result=$(
+  python3 run-query.py "$masked_query" |
+    awk -F '\t' '
+      NR == 1 { next }
+      substr($0, 1, 3) == "-- " { next }
+      {
+        rows++
+        if ($3 == "" || $3 + 0) invalid++
+      }
+      END { print (rows == 10 && invalid == 0) ? 1 : 0 }
+    '
+)
+check "mask query returns ten zero values" 1 "$masked_result"
+
+join_query="SELECT m.region,
+  m.day,
+  r.market,
+  r.manager,
+  m.value,
+  t.target,
+  m.value - t.target AS variance
+FROM scent.public.metrics AS m
+JOIN scent.public.regions AS r ON r.region = m.region
+JOIN scent.public.daily_targets AS t ON t.region = m.region AND t.day = m.day
+WHERE m.region = 'us-east'
+ORDER BY m.day
+LIMIT 5"
+check "3-table join returns five rows" 5 "$(python3 run-query.py "$join_query" | awk 'NR > 1 && $0 !~ /^-- / {count++} END {print count+0}')"
+
+parquet_files=$(docker compose exec -T trino-worker sh -c "find /tmp/scent-cache -type f -name '*.parquet' -print | grep -c . || true" | tr -d '\r')
+[ "${parquet_files:-0}" -ge 1 ] && parquet_files=1 || parquet_files=0
+check "join creates Parquet slice" 1 "$parquet_files"
+
 check "populate sum us-east"      7425.0  "$(scalar "SELECT sum(value) FROM scent.public.metrics WHERE region='us-east'")"
-pub=$(docker compose logs trino-worker 2>/dev/null | grep -c 'published slice'); check "1 slice published" 1 "$pub"
+pub=$(docker compose logs trino-worker 2>/dev/null | grep -c 'published slice' || true); [ "$pub" -ge 1 ] && pub=1; check "slice published" 1 "$pub"
 
 check "hit: sum us-east again"    7425.0  "$(scalar "SELECT sum(value) FROM scent.public.metrics WHERE region='us-east'")"
-hits=$(docker compose logs trino-worker 2>/dev/null | grep -c 'cache hit'); check "cache hit logged" 1 "$hits"
+hits=$(docker compose logs trino-worker 2>/dev/null | grep -c 'cache hit' || true); [ "$hits" -ge 1 ] && hits=1; check "cache hit logged" 1 "$hits"
 
 check "TopN day limit 3 rows"     3       "$(python3 run-query.py "SELECT day FROM scent.public.metrics WHERE region='us-east' ORDER BY day LIMIT 3" 2>/dev/null | grep -c '^2024-01-0')"
 check "0-col count(*)=100"        100     "$(scalar "SELECT count(*) FROM scent.public.metrics WHERE region='us-east'")"

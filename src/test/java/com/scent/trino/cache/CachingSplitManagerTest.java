@@ -87,7 +87,8 @@ class CachingSplitManagerTest {
                 delegateHandle,
                 new SchemaTableName("schema", "table"),
                 withColumnDomains(Map.of(columnA, Domain.singleValue(BigintType.BIGINT, 1L))),
-                Map.of("b", columnB, "a", columnA));
+                Map.of("b", columnB, "a", columnA),
+                Map.of("a", "bigint", "b", "varchar"));
         ConnectorSplit delegateSplit = new ConnectorSplit() {};
         StubSplitSource source = (StubSplitSource) stub.source;
         source.splits.add(delegateSplit);
@@ -104,6 +105,8 @@ class CachingSplitManagerTest {
         assertEquals(List.of(columnA, columnB), split.cachedChannelOrder());
         assertEquals(0, split.cachedChannelIndex(columnA));
         assertEquals(1, split.cachedChannelIndex(columnB));
+        assertEquals(Map.of("a", "bigint", "b", "varchar"), split.getColumnTypes());
+        assertEquals(List.of("bigint", "varchar"), split.cachedChannelTypes());
         assertTrue(split.getSliceKey().contains("schema.table"));
         assertTrue(split.getSliceKey().contains("|"));
         assertFalse(result.isFinished());
@@ -118,7 +121,8 @@ class CachingSplitManagerTest {
                 delegateHandle,
                 new SchemaTableName("schema", "table"),
                 TupleDomain.all(),
-                Map.of("a", columnA, "b", columnB));
+                Map.of("a", columnA, "b", columnB),
+                Map.of("a", "bigint", "b", "varchar"));
         ConnectorSplit delegateSplit = new ConnectorSplit() {};
         StubSplitSource source = (StubSplitSource) stub.source;
         source.splits.add(delegateSplit);
@@ -129,6 +133,7 @@ class CachingSplitManagerTest {
         List<ConnectorSplit> batch = result.getNextBatch(10, DynamicFilterSnapshot.EMPTY).join();
         assertEquals(1, batch.size());
         assertSame(delegateSplit, batch.get(0));
+        assertFalse(batch.get(0) instanceof CachingSplit);
     }
 
     @Test
@@ -144,6 +149,7 @@ class CachingSplitManagerTest {
                 delegateHandle,
                 new SchemaTableName("schema", "table"),
                 withColumnDomains(Map.of(columnA, Domain.singleValue(BigintType.BIGINT, 1L))),
+                null,
                 null);
         manager.getSplits(null, null, noColumns, Set.of(), Constraint.alwaysTrue());
         assertSame(delegateHandle, stub.receivedTable);

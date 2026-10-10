@@ -19,13 +19,10 @@ import java.util.concurrent.CompletableFuture;
 import java.util.function.UnaryOperator;
 
 @Slf4j
-public final class CachingSplitManager
-        implements ConnectorSplitManager
-{
+public final class CachingSplitManager implements ConnectorSplitManager {
     private final ConnectorSplitManager delegate;
 
-    public CachingSplitManager(ConnectorSplitManager delegate)
-    {
+    public CachingSplitManager(ConnectorSplitManager delegate) {
         this.delegate = Objects.requireNonNull(delegate, "delegate is null");
     }
 
@@ -35,10 +32,9 @@ public final class CachingSplitManager
             ConnectorSession session,
             ConnectorTableHandle table,
             Set<ColumnHandle> columns,
-            Constraint constraint)
-    {
+            Constraint constraint) {
         if (table instanceof CachingTableHandle caching && isCacheable(caching)) {
-            log.debug("[SCENT SPI] getSplits wrapping {} splits for {}", caching);
+            log.debug("[SCENT SPI] getSplits wrapping splits for {}", caching);
             String sliceKey = sliceKey(caching);
             return new CachingSplitSource(
                     delegate.getSplits(transaction, session, caching.getDelegateHandle(), columns, constraint),
@@ -46,6 +42,7 @@ public final class CachingSplitManager
                             sliceKey,
                             caching.getPartitionDomain(),
                             caching.getColumnHandles(),
+                            caching.getColumnTypes(),
                             split,
                             caching.getDelegateHandle()));
         }
@@ -57,8 +54,7 @@ public final class CachingSplitManager
     public ConnectorSplitSource getSplits(
             ConnectorTransactionHandle transaction,
             ConnectorSession session,
-            ConnectorTableFunctionHandle function)
-    {
+            ConnectorTableFunctionHandle function) {
         return delegate.getSplits(transaction, session, function);
     }
 
@@ -66,8 +62,7 @@ public final class CachingSplitManager
      * Cacheable when a partition predicate was pushed and the column layout is known;
      * otherwise pass through uncached (C7).
      */
-    private static boolean isCacheable(CachingTableHandle caching)
-    {
+    private static boolean isCacheable(CachingTableHandle caching) {
         return !caching.getPartitionDomain().isAll() && caching.getColumnHandles() != null;
     }
 
@@ -76,24 +71,19 @@ public final class CachingSplitManager
      * cache entries (never mis-serve — keys are exact strings). Upgrade to a structural key
      * if that ever matters.
      */
-    private static String sliceKey(CachingTableHandle caching)
-    {
+    private static String sliceKey(CachingTableHandle caching) {
         return caching.getSchemaTableName() + "|" + caching.getPartitionDomain();
     }
 
-    private static ConnectorTableHandle unwrap(ConnectorTableHandle table)
-    {
+    private static ConnectorTableHandle unwrap(ConnectorTableHandle table) {
         return table instanceof CachingTableHandle caching ? caching.getDelegateHandle() : table;
     }
 
     private record CachingSplitSource(
             ConnectorSplitSource delegate,
-            UnaryOperator<ConnectorSplit> wrapper)
-            implements ConnectorSplitSource
-    {
+            UnaryOperator<ConnectorSplit> wrapper) implements ConnectorSplitSource {
         @Override
-        public CompletableFuture<List<ConnectorSplit>> getNextBatch(int maxSize, DynamicFilterSnapshot dynamicFilterSnapshot)
-        {
+        public CompletableFuture<List<ConnectorSplit>> getNextBatch(int maxSize, DynamicFilterSnapshot dynamicFilterSnapshot) {
             return delegate.getNextBatch(maxSize, dynamicFilterSnapshot)
                     .thenApply(batch -> batch.stream().map(wrapper).toList());
         }

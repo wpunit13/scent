@@ -6,14 +6,17 @@ import io.trino.spi.TrinoException;
 import io.trino.spi.connector.Connector;
 import io.trino.spi.connector.ConnectorContext;
 import io.trino.spi.connector.ConnectorFactory;
+import lombok.extern.slf4j.Slf4j;
 
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
 
 import static io.trino.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
 
-public class CachingConnectorFactory
-        implements ConnectorFactory {
+@Slf4j
+public class CachingConnectorFactory implements ConnectorFactory {
 
     private final DelegateConnectorResolver delegateResolver;
 
@@ -48,6 +51,8 @@ public class CachingConnectorFactory
                 ? Long.parseLong(config.get("cache.max-bytes"))
                 : 256L * 1024 * 1024;
 
+        Path storageDirectory = parseStorageDirectory(config);
+
         ConnectorFactory delegateFactory = delegateResolver.resolve(delegateName);
 
         Map<String, String> delegateConfig = new HashMap<>(config);
@@ -59,7 +64,9 @@ public class CachingConnectorFactory
                         delegateConfig,
                         context);
 
-        return CachingConnector.wrap(delegateConnector, partitionColumn, new InMemorySliceStore(cacheMaxBytes));
+        return CachingConnector.wrap(delegateConnector, partitionColumn, new InMemorySliceStore(cacheMaxBytes,
+                        context.getTypeManager(),
+                        storageDirectory));
     }
 
     /**
@@ -76,6 +83,28 @@ public class CachingConnectorFactory
                             "SCENT plugin in catalog '%s' was built for Trino %s but the cluster is running Trino %s. "
                                     + "Rebuild the plugin against the cluster's Trino version.",
                             catalogName, BuildInfo.trinoVersion(), runtimeVersion));
+        }
+    }
+
+    private static Path parseStorageDirectory(Map<String, String> config) {
+        if (!Boolean.parseBoolean(config.getOrDefault("cache.shared.memory", "false"))) {
+            log.error("cache.shared.memory is not configured correctly");
+            return null;
+        }
+
+        String directory = config.get("cache.storage.directory");
+
+        if (directory == null || directory.isBlank()) {
+            log.error("cache.shared.memory is enabled but cache.storage.directory is missing; Parquet storage is disabled");
+            return null;
+        }
+
+        try {
+            return Path.of(directory);
+        }
+        catch (InvalidPathException e) {
+            log.error("Invalid cache.storage.directory '{}'; Parquet storage is disabled", directory, e);
+            return null;
         }
     }
 }

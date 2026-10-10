@@ -18,12 +18,11 @@ import java.util.Objects;
  * the cache key, the partition predicate, the delegate's full column set (fixing the cached
  * page layout), and the underlying delegate split.
  */
-public final class CachingSplit
-        implements ConnectorSplit
-{
+public final class CachingSplit implements ConnectorSplit {
     private final String sliceKey;
     private final TupleDomain<ColumnHandle> partitionDomain;
     private final Map<String, ColumnHandle> columnHandles;
+    private final Map<String, String> columnTypes;
     private final ConnectorSplit delegateSplit;
     private final ConnectorTableHandle delegateTableHandle;
 
@@ -32,12 +31,13 @@ public final class CachingSplit
             @JsonProperty("sliceKey") String sliceKey,
             @JsonProperty("partitionDomain") TupleDomain<ColumnHandle> partitionDomain,
             @JsonProperty("columnHandles") Map<String, ColumnHandle> columnHandles,
+            @JsonProperty("columnTypes") Map<String, String> columnTypes,
             @JsonProperty("delegateSplit") ConnectorSplit delegateSplit,
-            @JsonProperty("delegateTableHandle") ConnectorTableHandle delegateTableHandle)
-    {
+            @JsonProperty("delegateTableHandle") ConnectorTableHandle delegateTableHandle) {
         this.sliceKey = Objects.requireNonNull(sliceKey, "sliceKey is null");
         this.partitionDomain = Objects.requireNonNull(partitionDomain, "partitionDomain is null");
         this.columnHandles = Objects.requireNonNull(columnHandles, "columnHandles is null");
+        this.columnTypes = columnTypes == null ? Map.of() : Map.copyOf(columnTypes);
         this.delegateSplit = Objects.requireNonNull(delegateSplit, "delegateSplit is null");
         this.delegateTableHandle = Objects.requireNonNull(delegateTableHandle, "delegateTableHandle is null");
     }
@@ -61,6 +61,12 @@ public final class CachingSplit
     }
 
     @JsonProperty
+    public Map<String, String> getColumnTypes()
+    {
+        return columnTypes;
+    }
+
+    @JsonProperty
     public ConnectorSplit getDelegateSplit()
     {
         return delegateSplit;
@@ -77,17 +83,25 @@ public final class CachingSplit
      * populate read requests columns in the same order. Sorted keys keep the layout
      * deterministic across transactions, which the slice identity depends on.
      */
-    public List<ColumnHandle> cachedChannelOrder()
-    {
+    public List<ColumnHandle> cachedChannelOrder() {
         return columnHandles.entrySet().stream()
                 .sorted(Map.Entry.comparingByKey())
                 .map(Map.Entry::getValue)
                 .toList();
     }
 
-    /** Position of a requested column in the cached page layout, or -1 if unknown. */
-    public int cachedChannelIndex(ColumnHandle columnHandle)
+    public List<String> cachedChannelNames()
     {
+        return columnHandles.keySet().stream().sorted().toList();
+    }
+
+    public List<String> cachedChannelTypes()
+    {
+        return cachedChannelNames().stream().map(columnTypes::get).toList();
+    }
+
+    /** Position of a requested column in the cached page layout, or -1 if unknown. */
+    public int cachedChannelIndex(ColumnHandle columnHandle) {
         List<ColumnHandle> order = cachedChannelOrder();
         return order.indexOf(columnHandle);
     }

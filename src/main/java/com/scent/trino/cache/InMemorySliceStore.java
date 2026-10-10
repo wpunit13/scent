@@ -1,8 +1,10 @@
 package com.scent.trino.cache;
 
 import io.trino.spi.Page;
+import io.trino.spi.type.TypeManager;
 import lombok.extern.slf4j.Slf4j;
 
+import java.nio.file.Path;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -13,22 +15,23 @@ import java.util.Optional;
  * Worker-local slice cache: keyed slices of raw pages, FIFO-evicted under a byte cap.
  */
 @Slf4j
-public final class InMemorySliceStore
-{
+public final class InMemorySliceStore {
     private final long maxBytes;
+    private final TypeManager typeManager;
+    private final Path storageDirectory;
     private final Map<String, List<Page>> slices = new LinkedHashMap<>();
     private long totalBytes;
 
-    public InMemorySliceStore(long maxBytes)
-    {
+    public InMemorySliceStore(long maxBytes, TypeManager typeManager, Path storageDirectory) {
         if (maxBytes <= 0) {
             throw new IllegalArgumentException("maxBytes must be positive, got: " + maxBytes);
         }
         this.maxBytes = maxBytes;
+        this.typeManager = typeManager;
+        this.storageDirectory = storageDirectory;
     }
 
-    public synchronized void put(String key, List<Page> pages)
-    {
+    public synchronized void put(String key, List<Page> pages, List<String> columnNames, List<String> columnTypes) {
         long bytes = sizeOf(pages);
         if (bytes > maxBytes) {
             log.debug("[SCENT] slice {} ({} bytes) exceeds cache cap ({} bytes), not cached", key, bytes, maxBytes);
@@ -42,6 +45,15 @@ public final class InMemorySliceStore
             totalBytes -= sizeOf(previous);
         }
         totalBytes += bytes;
+        if (storageDirectory != null) {
+            try {
+                ParquetSliceWriter.write(key, pages, columnNames, columnTypes, typeManager, storageDirectory);
+                log.info("[SCENT] Parquet slice {} written successfully", key);
+            }
+            catch (Exception e) {
+                log.warn("[SCENT] failed to write Parquet slice {} to disk", key, e);
+            }
+        }
     }
 
     public synchronized Optional<List<Page>> get(String key)
@@ -54,8 +66,7 @@ public final class InMemorySliceStore
         return totalBytes;
     }
 
-    private void evictOldest()
-    {
+    private void evictOldest() {
         Iterator<Map.Entry<String, List<Page>>> iterator = slices.entrySet().iterator();
         Map.Entry<String, List<Page>> oldest = iterator.next();
         iterator.remove();
@@ -72,5 +83,10 @@ public final class InMemorySliceStore
     public long maxBytes()
     {
         return maxBytes;
+    }
+
+    public boolean isParquetEnabled()
+    {
+        return storageDirectory != null;
     }
 }

@@ -164,12 +164,19 @@ Delegate plugins elsewhere on the cluster are unaffected. A delegate whose jars 
 # /etc/trino/catalog/cached_pg.properties
 connector.name=cache_wrapper
 delegate.connector.name=postgresql
+cache.shared.memory=true
+cache.storage.directory=/tmp/scent-cache
 
 # Upstream connector credentials (passed through to the delegate)
 connection-url=jdbc:postgresql://postgres.production.internal:5432/analytics
 connection-user=trino_readonly
 connection-password=secure_password
 ```
+### Trino Pages To Parquet Storage
+
+When `cache.shared.memory=true`, each completed in-memory slice is also written as a typed Parquet file under the configured `cache.storage.directory`. The file is a local copy; SCENT continues to serve cache hits from memory.
+
+If shared-memory caching is enabled without a valid `cache.storage.directory`, SCENT logs an error, keeps the in-memory cache enabled, and skips Parquet storage.
 
 ### Version lock
 

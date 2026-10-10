@@ -15,11 +15,15 @@ import io.trino.spi.connector.DynamicFilter;
 import io.trino.spi.connector.FixedPageSource;
 import io.trino.spi.connector.SourcePage;
 import io.trino.spi.predicate.Domain;
-import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.type.BigintType;
+import io.trino.spi.type.TypeManager;
+import io.trino.spi.type.VarcharType;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -100,7 +104,7 @@ class CachingPageSourceProviderTest {
     private final ColumnHandle columnA = new ColumnHandle() {};
     private final ColumnHandle columnB = new ColumnHandle() {};
     private final RecordingDelegate delegate = new RecordingDelegate();
-    private final InMemorySliceStore store = new InMemorySliceStore(1024 * 1024);
+    private final InMemorySliceStore store = new InMemorySliceStore(1024 * 1024, null, null);
     private final CachingPageSourceProvider provider = new CachingPageSourceProvider(delegate, store);
 
     private static Block byteBlock(int value) {
@@ -112,6 +116,7 @@ class CachingPageSourceProviderTest {
                 sliceKey,
                 withColumnDomains(Map.of(columnA, Domain.singleValue(BigintType.BIGINT, 1L))),
                 Map.of("a", columnA, "b", columnB), // cached layout: [columnA, columnB] (sorted)
+                Map.of(),
                 new ConnectorSplit() {},
                 new ConnectorTableHandle() {});
     }
@@ -168,10 +173,49 @@ class CachingPageSourceProviderTest {
     }
 
     @Test
+    void completedPopulateWritesParquetUsingSplitColumnTypes(@TempDir Path cacheDirectory) throws IOException {
+        List<String> resolvedTypeNames = new ArrayList<>();
+        TypeManager typeManager = (TypeManager) java.lang.reflect.Proxy.newProxyInstance(
+                TypeManager.class.getClassLoader(),
+                new Class<?>[] {TypeManager.class},
+                (proxy, method, arguments) -> {
+                    if (!method.getName().equals("fromSqlType")) {
+                        return null;
+                    }
+                    String typeName = (String) arguments[0];
+                    resolvedTypeNames.add(typeName);
+                    return switch (typeName) {
+                        case "bigint" -> BigintType.BIGINT;
+                        case "varchar" -> VarcharType.VARCHAR;
+                        default -> throw new IllegalArgumentException("Unexpected type: " + typeName);
+                    };
+                });
+        InMemorySliceStore diskStore = new InMemorySliceStore(1024 * 1024, typeManager, cacheDirectory);
+        CachingPageSourceProvider diskProvider = new CachingPageSourceProvider(delegate, diskStore);
+        delegate.pagesToServe = List.of();
+        CachingSplit split = new CachingSplit(
+                "schema.table|p=typed",
+                withColumnDomains(Map.of(columnA, Domain.singleValue(BigintType.BIGINT, 1L))),
+                Map.of("a", columnA, "b", columnB),
+                Map.of("b", "varchar", "a", "bigint"),
+                new ConnectorSplit() {},
+                new ConnectorTableHandle() {});
+
+        ConnectorPageSource source = diskProvider.createPageSource(
+                null, null, split, new ConnectorTableHandle() {},
+                Optional.empty(), List.of(columnA), DynamicFilter.EMPTY);
+        drain(source);
+
+        assertTrue(diskStore.get(split.getSliceKey()).isPresent());
+        assertTrue(Files.size(cacheDirectory.resolve(split.getSliceKey() + ".parquet")) > 0);
+        assertEquals(List.of("bigint", "varchar"), resolvedTypeNames);
+    }
+
+    @Test
     void hitServesCachedPagesProjectedToRequestedOrder() throws IOException {
         Block rawA = byteBlock(1);
         Block rawB = byteBlock(2);
-        store.put("schema.table|p=1", List.of(new Page(rawA, rawB)));
+        store.put("schema.table|p=1", List.of(new Page(rawA, rawB)), List.of("a", "b"), List.of("bigint", "bigint"));
         CachingSplit split = split("schema.table|p=1");
 
         // Reversed request order must be projected back correctly; delegate is never touched
@@ -262,7 +306,7 @@ class CachingPageSourceProviderTest {
     void oversizeSliceNeverPublishes() throws IOException {
         delegate.pagesToServe = List.of(new Page(byteBlock(1), byteBlock(2)));
         // Cap smaller than one page: everything is over cap from the first page
-        InMemorySliceStore tinyStore = new InMemorySliceStore(1);
+        InMemorySliceStore tinyStore = new InMemorySliceStore(1, null, null);
         CachingPageSourceProvider tinyProvider = new CachingPageSourceProvider(delegate, tinyStore);
         CachingSplit split = split("schema.table|p=1");
 

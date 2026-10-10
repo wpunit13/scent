@@ -1,10 +1,10 @@
 package com.scent.trino.cache;
 
 import io.trino.spi.connector.Connector;
+import io.trino.spi.connector.ConnectorMetadata;
 import io.trino.spi.connector.ConnectorPageSourceProvider;
 import io.trino.spi.connector.ConnectorPageSourceProviderFactory;
 import io.trino.spi.connector.ConnectorSplitManager;
-import io.trino.spi.connector.ConnectorMetadata;
 import lombok.extern.slf4j.Slf4j;
 
 import java.lang.reflect.InvocationHandler;
@@ -34,8 +34,7 @@ public final class CachingConnector implements InvocationHandler {
     }
 
     @Override
-    public Object invoke(Object proxy, Method method, Object[] arguments)
-            throws Throwable {
+    public Object invoke(Object proxy, Method method, Object[] arguments) throws Throwable {
         try {
             Object result = method.invoke(delegate, arguments);
             if (method.getDeclaringClass() != Object.class) {
@@ -50,7 +49,7 @@ public final class CachingConnector implements InvocationHandler {
 
     private Object wrapResult(Method method, Object result) {
         return switch (method.getName()) {
-            case "getMetadata" -> CachingMetadata.wrap((ConnectorMetadata) result, partitionColumn);
+            case "getMetadata" -> CachingMetadata.wrap((ConnectorMetadata) result, partitionColumn, sliceStore.isParquetEnabled());
             case "getSplitManager" -> new CachingSplitManager((ConnectorSplitManager) result);
             case "getPageSourceProvider" -> new CachingPageSourceProvider((ConnectorPageSourceProvider) result, sliceStore);
             case "getPageSourceProviderFactory" -> {ConnectorPageSourceProviderFactory factory = (ConnectorPageSourceProviderFactory) result;
