@@ -19,7 +19,7 @@ public final class InMemorySliceStore {
     private final long maxBytes;
     private final TypeManager typeManager;
     private final Path storageDirectory;
-    private final Map<String, List<Page>> slices = new LinkedHashMap<>();
+    private final Map<CacheKey, List<Page>> slices = new LinkedHashMap<>();
     private long totalBytes;
 
     public InMemorySliceStore(long maxBytes, TypeManager typeManager, Path storageDirectory) {
@@ -31,7 +31,7 @@ public final class InMemorySliceStore {
         this.storageDirectory = storageDirectory;
     }
 
-    public synchronized void put(String key, List<Page> pages, List<String> columnNames, List<String> columnTypes) {
+    public synchronized void put(CacheKey key, List<Page> pages, List<String> columnNames, List<String> columnTypes) {
         long bytes = sizeOf(pages);
         if (bytes > maxBytes) {
             log.debug("[SCENT] slice {} ({} bytes) exceeds cache cap ({} bytes), not cached", key, bytes, maxBytes);
@@ -47,7 +47,7 @@ public final class InMemorySliceStore {
         totalBytes += bytes;
         if (storageDirectory != null) {
             try {
-                ParquetSliceWriter.write(key, pages, columnNames, columnTypes, typeManager, storageDirectory);
+                ParquetSliceWriter.write(key.pathSegment(), pages, columnNames, columnTypes, typeManager, storageDirectory);
                 log.info("[SCENT] Parquet slice {} written successfully", key);
             }
             catch (Exception e) {
@@ -56,7 +56,7 @@ public final class InMemorySliceStore {
         }
     }
 
-    public synchronized Optional<List<Page>> get(String key)
+    public synchronized Optional<List<Page>> get(CacheKey key)
     {
         return Optional.ofNullable(slices.get(key));
     }
@@ -67,8 +67,8 @@ public final class InMemorySliceStore {
     }
 
     private void evictOldest() {
-        Iterator<Map.Entry<String, List<Page>>> iterator = slices.entrySet().iterator();
-        Map.Entry<String, List<Page>> oldest = iterator.next();
+        Iterator<Map.Entry<CacheKey, List<Page>>> iterator = slices.entrySet().iterator();
+        Map.Entry<CacheKey, List<Page>> oldest = iterator.next();
         iterator.remove();
         totalBytes -= sizeOf(oldest.getValue());
         log.debug("[SCENT] evicted slice {} ({} bytes)", oldest.getKey(), sizeOf(oldest.getValue()));

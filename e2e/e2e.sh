@@ -4,9 +4,13 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
-# JDK 25 is required. Honour an explicit JAVA_HOME, else discover one, then verify.
-if [ -z "${JAVA_HOME:-}" ]; then
+# Pick a JDK 25: a valid JAVA_HOME wins, else macOS discovery, else fail.
+if [ -n "${JAVA_HOME:-}" ] && "$JAVA_HOME/bin/javac" -version 2>&1 | grep -q 'javac 25'; then
+  : # JAVA_HOME already points at a JDK 25
+elif [ -x /usr/libexec/java_home ]; then
   JAVA_HOME="$(/usr/libexec/java_home -v 25 2>/dev/null || true)"
+else
+  JAVA_HOME=""
 fi
 if [ -z "${JAVA_HOME:-}" ] || ! "$JAVA_HOME/bin/javac" -version 2>&1 | grep -q 'javac 25'; then
   echo "error: JDK 25 required; set JAVA_HOME to a JDK 25 install" >&2

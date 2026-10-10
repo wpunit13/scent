@@ -45,12 +45,12 @@ public class CachingPageSourceProvider implements ConnectorPageSourceProvider {
         if (split instanceof CachingSplit caching) {
             int[] channels = channelsFor(columns, caching);
             if (channels != null) {
-                Optional<List<Page>> cached = sliceStore.get(caching.getSliceKey());
+                Optional<List<Page>> cached = sliceStore.get(caching.getCacheKey());
                 if (cached.isPresent()) {
-                    log.debug("[SCENT] cache hit for {}", caching.getSliceKey());
+                    log.debug("[SCENT] cache hit for {}", caching.getCacheKey());
                     return new FixedPageSource(project(cached.get(), channels));
                 }
-                log.debug("[SCENT] cache miss for {}, populating", caching.getSliceKey());
+                log.debug("[SCENT] cache miss for {}, populating", caching.getCacheKey());
                 ConnectorPageSource source = delegate.createPageSource(
                         transaction,
                         session,
@@ -64,7 +64,7 @@ public class CachingPageSourceProvider implements ConnectorPageSourceProvider {
             }
             // Requested column unknown to the cached layout (e.g. schema changed mid-flight):
             // degrade to the delegate read for this split.
-            log.debug("[SCENT] unknown requested column for {}, passing through", caching.getSliceKey());
+            log.debug("[SCENT] unknown requested column for {}, passing through", caching.getCacheKey());
             return delegate.createPageSource(
                     transaction,
                     session,
@@ -194,7 +194,7 @@ public class CachingPageSourceProvider implements ConnectorPageSourceProvider {
             // so a completed buffer can publish here too; publishIfComplete is idempotent.
             publishIfComplete();
             if (!published && !overCap) {
-                log.debug("[SCENT] discarded partial slice {}", split.getSliceKey());
+                log.debug("[SCENT] discarded partial slice {}", split.getCacheKey());
             }
             delegate.close();
         }
@@ -206,8 +206,8 @@ public class CachingPageSourceProvider implements ConnectorPageSourceProvider {
         private void publishIfComplete() {
             if (!published && !overCap && delegate.isFinished()) {
                 published = true;
-                sliceStore.put(split.getSliceKey(), buffer, split.cachedChannelNames(), split.cachedChannelTypes());
-                log.debug("[SCENT] published slice {} ({} bytes)", split.getSliceKey(), bufferedBytes);
+                sliceStore.put(split.getCacheKey(), buffer, split.cachedChannelNames(), split.cachedChannelTypes());
+                log.debug("[SCENT] published slice {} ({} bytes)", split.getCacheKey(), bufferedBytes);
             }
         }
     }

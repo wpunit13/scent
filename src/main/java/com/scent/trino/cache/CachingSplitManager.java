@@ -35,12 +35,11 @@ public final class CachingSplitManager implements ConnectorSplitManager {
             Constraint constraint) {
         if (table instanceof CachingTableHandle caching && isCacheable(caching)) {
             log.debug("[SCENT SPI] getSplits wrapping splits for {}", caching);
-            String sliceKey = sliceKey(caching);
+            CacheKey cacheKey = CacheKey.of(caching.getSchemaTableName(), caching.getPartitionDomain());
             return new CachingSplitSource(
                     delegate.getSplits(transaction, session, caching.getDelegateHandle(), columns, constraint),
                     split -> new CachingSplit(
-                            sliceKey,
-                            caching.getPartitionDomain(),
+                            cacheKey,
                             caching.getColumnHandles(),
                             caching.getColumnTypes(),
                             split,
@@ -64,15 +63,6 @@ public final class CachingSplitManager implements ConnectorSplitManager {
      */
     private static boolean isCacheable(CachingTableHandle caching) {
         return !caching.getPartitionDomain().isAll() && caching.getColumnHandles() != null;
-    }
-
-    /**
-     * ponytail: slice key uses TupleDomain.toString(); a predicate-format change would orphan
-     * cache entries (never mis-serve — keys are exact strings). Upgrade to a structural key
-     * if that ever matters.
-     */
-    private static String sliceKey(CachingTableHandle caching) {
-        return caching.getSchemaTableName() + "|" + caching.getPartitionDomain();
     }
 
     private static ConnectorTableHandle unwrap(ConnectorTableHandle table) {

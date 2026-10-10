@@ -4,6 +4,8 @@ import io.trino.spi.Page;
 import io.trino.spi.block.ByteArrayBlock;
 import io.trino.spi.type.BigintType;
 import io.trino.spi.type.TypeManager;
+import io.trino.spi.connector.SchemaTableName;
+import io.trino.spi.predicate.TupleDomain;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -21,6 +23,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class InMemorySliceStoreTest {
 
+    private static CacheKey key(String name) {
+        return CacheKey.of(new SchemaTableName("schema", name), TupleDomain.all());
+    }
+
     private static Page pageOfBytes(int positions, int bytesPerPosition) {
         byte[] values = new byte[positions * bytesPerPosition];
         Arrays.fill(values, (byte) 7);
@@ -33,11 +39,11 @@ class InMemorySliceStoreTest {
         assertFalse(store.isParquetEnabled());
         Page page = pageOfBytes(10, 4);
 
-        assertTrue(store.get("missing").isEmpty());
+        assertTrue(store.get(key("missing")).isEmpty());
 
-        store.put("slice", List.of(page), List.of(), List.of());
+        store.put(key("slice"), List.of(page), List.of(), List.of());
 
-        assertEquals(Optional.of(List.of(page)), store.get("slice"));
+        assertEquals(Optional.of(List.of(page)), store.get(key("slice")));
         assertEquals(page.getSizeInBytes(), store.totalBytes());
     }
 
@@ -49,11 +55,11 @@ class InMemorySliceStoreTest {
                 (proxy, method, arguments) -> method.getName().equals("fromSqlType") ? BigintType.BIGINT : null);
         InMemorySliceStore store = new InMemorySliceStore(1024 * 1024, typeManager, storageDirectory);
 
-        store.put("slice", List.of(), List.of("a"), List.of("bigint"));
+        store.put(key("slice"), List.of(), List.of("a"), List.of("bigint"));
 
         assertTrue(store.isParquetEnabled());
-        assertTrue(store.get("slice").isPresent());
-        assertTrue(Files.size(storageDirectory.resolve("slice.parquet")) > 0);
+        assertTrue(store.get(key("slice")).isPresent());
+        assertTrue(Files.size(storageDirectory.resolve(key("slice").pathSegment() + ".parquet")) > 0);
     }
 
     @Test
@@ -65,10 +71,10 @@ class InMemorySliceStoreTest {
         Page page = pageOfBytes(100, 4);
         InMemorySliceStore store = new InMemorySliceStore(page.getSizeInBytes() - 1, typeManager, storageDirectory);
 
-        store.put("oversized", List.of(page), List.of("a"), List.of("bigint"));
+        store.put(key("oversized"), List.of(page), List.of("a"), List.of("bigint"));
 
-        assertTrue(store.get("oversized").isEmpty());
-        assertTrue(Files.notExists(storageDirectory.resolve("oversized.parquet")));
+        assertTrue(store.get(key("oversized")).isEmpty());
+        assertTrue(Files.notExists(storageDirectory.resolve(key("oversized").pathSegment() + ".parquet")));
     }
 
     @Test
@@ -77,9 +83,9 @@ class InMemorySliceStoreTest {
         InMemorySliceStore store = new InMemorySliceStore(1024 * 1024, null, storageDirectory);
         Page page = pageOfBytes(10, 1);
 
-        store.put("slice", List.of(page), List.of("a"), List.of("bigint"));
+        store.put(key("slice"), List.of(page), List.of("a"), List.of("bigint"));
 
-        assertEquals(List.of(page), store.get("slice").orElseThrow());
+        assertEquals(List.of(page), store.get(key("slice")).orElseThrow());
         assertEquals(page.getSizeInBytes(), store.totalBytes());
     }
 
@@ -90,11 +96,11 @@ class InMemorySliceStoreTest {
         // Cap holds the small slice but not both
         InMemorySliceStore store = new InMemorySliceStore(big.getSizeInBytes() + small.getSizeInBytes() - 1, null, null);
 
-        store.put("big", List.of(big), List.of(), List.of());
-        store.put("small", List.of(small), List.of(), List.of());
+        store.put(key("big"), List.of(big), List.of(), List.of());
+        store.put(key("small"), List.of(small), List.of(), List.of());
 
-        assertTrue(store.get("big").isEmpty());
-        assertEquals(List.of(small), store.get("small").orElseThrow());
+        assertTrue(store.get(key("big")).isEmpty());
+        assertEquals(List.of(small), store.get(key("small")).orElseThrow());
         assertEquals(small.getSizeInBytes(), store.totalBytes());
     }
 
@@ -104,11 +110,11 @@ class InMemorySliceStoreTest {
         Page small = pageOfBytes(10, 4);
         InMemorySliceStore store = new InMemorySliceStore(big.getSizeInBytes() - 1, null, null);
 
-        store.put("big", List.of(big), List.of(), List.of());
-        store.put("small", List.of(small), List.of(), List.of());
+        store.put(key("big"), List.of(big), List.of(), List.of());
+        store.put(key("small"), List.of(small), List.of(), List.of());
 
-        assertTrue(store.get("big").isEmpty());
-        assertEquals(List.of(small), store.get("small").orElseThrow());
+        assertTrue(store.get(key("big")).isEmpty());
+        assertEquals(List.of(small), store.get(key("small")).orElseThrow());
     }
 
     @Test
@@ -117,10 +123,10 @@ class InMemorySliceStoreTest {
         Page second = pageOfBytes(20, 1);
         InMemorySliceStore store = new InMemorySliceStore(1024 * 1024, null, null);
 
-        store.put("k", List.of(first), List.of(), List.of());
-        store.put("k", List.of(second), List.of(), List.of());
+        store.put(key("k"), List.of(first), List.of(), List.of());
+        store.put(key("k"), List.of(second), List.of(), List.of());
 
-        assertEquals(List.of(second), store.get("k").orElseThrow());
+        assertEquals(List.of(second), store.get(key("k")).orElseThrow());
         assertEquals(second.getSizeInBytes(), store.totalBytes());
     }
 

@@ -7,7 +7,6 @@ import io.trino.spi.SplitWeight;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ConnectorSplit;
 import io.trino.spi.connector.ConnectorTableHandle;
-import io.trino.spi.predicate.TupleDomain;
 
 import java.util.List;
 import java.util.Map;
@@ -15,12 +14,11 @@ import java.util.Objects;
 
 /**
  * Split wrapper carrying everything the page source needs to serve or populate a slice:
- * the cache key, the partition predicate, the delegate's full column set (fixing the cached
- * page layout), and the underlying delegate split.
+ * the content-addressed cache key, the delegate's full column set and types (fixing the
+ * cached page layout), and the underlying delegate split.
  */
 public final class CachingSplit implements ConnectorSplit {
-    private final String sliceKey;
-    private final TupleDomain<ColumnHandle> partitionDomain;
+    private final CacheKey cacheKey;
     private final Map<String, ColumnHandle> columnHandles;
     private final Map<String, String> columnTypes;
     private final ConnectorSplit delegateSplit;
@@ -28,14 +26,12 @@ public final class CachingSplit implements ConnectorSplit {
 
     @JsonCreator
     public CachingSplit(
-            @JsonProperty("sliceKey") String sliceKey,
-            @JsonProperty("partitionDomain") TupleDomain<ColumnHandle> partitionDomain,
+            @JsonProperty("cacheKey") CacheKey cacheKey,
             @JsonProperty("columnHandles") Map<String, ColumnHandle> columnHandles,
             @JsonProperty("columnTypes") Map<String, String> columnTypes,
             @JsonProperty("delegateSplit") ConnectorSplit delegateSplit,
             @JsonProperty("delegateTableHandle") ConnectorTableHandle delegateTableHandle) {
-        this.sliceKey = Objects.requireNonNull(sliceKey, "sliceKey is null");
-        this.partitionDomain = Objects.requireNonNull(partitionDomain, "partitionDomain is null");
+        this.cacheKey = Objects.requireNonNull(cacheKey, "cacheKey is null");
         this.columnHandles = Objects.requireNonNull(columnHandles, "columnHandles is null");
         this.columnTypes = columnTypes == null ? Map.of() : Map.copyOf(columnTypes);
         this.delegateSplit = Objects.requireNonNull(delegateSplit, "delegateSplit is null");
@@ -43,15 +39,9 @@ public final class CachingSplit implements ConnectorSplit {
     }
 
     @JsonProperty
-    public String getSliceKey()
+    public CacheKey getCacheKey()
     {
-        return sliceKey;
-    }
-
-    @JsonProperty
-    public TupleDomain<ColumnHandle> getPartitionDomain()
-    {
-        return partitionDomain;
+        return cacheKey;
     }
 
     @JsonProperty
@@ -133,6 +123,6 @@ public final class CachingSplit implements ConnectorSplit {
     @Override
     public String toString()
     {
-        return sliceKey;
+        return cacheKey.toString();
     }
 }

@@ -11,6 +11,7 @@ import io.trino.spi.connector.ConnectorSplit;
 import io.trino.spi.connector.ConnectorTableCredentials;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTransactionHandle;
+import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.connector.DynamicFilter;
 import io.trino.spi.connector.FixedPageSource;
 import io.trino.spi.connector.SourcePage;
@@ -111,14 +112,19 @@ class CachingPageSourceProviderTest {
         return new ByteArrayBlock(1, Optional.empty(), new byte[] {(byte) value});
     }
 
-    private CachingSplit split(String sliceKey) {
+    private CachingSplit split() {
         return new CachingSplit(
-                sliceKey,
-                withColumnDomains(Map.of(columnA, Domain.singleValue(BigintType.BIGINT, 1L))),
+                sliceKey(),
                 Map.of("a", columnA, "b", columnB), // cached layout: [columnA, columnB] (sorted)
                 Map.of(),
                 new ConnectorSplit() {},
                 new ConnectorTableHandle() {});
+    }
+
+    private CacheKey sliceKey() {
+        return CacheKey.of(
+                new SchemaTableName("schema", "table"),
+                withColumnDomains(Map.of(columnA, Domain.singleValue(BigintType.BIGINT, 1L))));
     }
 
     private static List<Page> drain(ConnectorPageSource source) throws IOException {
@@ -146,7 +152,7 @@ class CachingPageSourceProviderTest {
         Block rawA2 = byteBlock(3);
         Block rawB2 = byteBlock(4);
         delegate.pagesToServe = List.of(new Page(rawA, rawB), new Page(rawA2, rawB2));
-        CachingSplit split = split("schema.table|p=1");
+        CachingSplit split = split();
 
         ConnectorPageSource source = provider.createPageSource(
                 null, null, split, new ConnectorTableHandle() {},
@@ -165,7 +171,7 @@ class CachingPageSourceProviderTest {
         assertSame(rawB2, emitted.get(1).getBlock(0));
 
         // Clean finish publishes the raw slice
-        List<Page> cached = store.get("schema.table|p=1").orElseThrow();
+        List<Page> cached = store.get(sliceKey()).orElseThrow();
         assertEquals(2, cached.size());
         assertSame(rawA, cached.get(0).getBlock(0));
         assertSame(rawB, cached.get(0).getBlock(1));
@@ -194,8 +200,7 @@ class CachingPageSourceProviderTest {
         CachingPageSourceProvider diskProvider = new CachingPageSourceProvider(delegate, diskStore);
         delegate.pagesToServe = List.of();
         CachingSplit split = new CachingSplit(
-                "schema.table|p=typed",
-                withColumnDomains(Map.of(columnA, Domain.singleValue(BigintType.BIGINT, 1L))),
+                CacheKey.of(new SchemaTableName("schema", "table"), withColumnDomains(Map.of(columnA, Domain.singleValue(BigintType.BIGINT, 1L)))),
                 Map.of("a", columnA, "b", columnB),
                 Map.of("b", "varchar", "a", "bigint"),
                 new ConnectorSplit() {},
@@ -206,8 +211,8 @@ class CachingPageSourceProviderTest {
                 Optional.empty(), List.of(columnA), DynamicFilter.EMPTY);
         drain(source);
 
-        assertTrue(diskStore.get(split.getSliceKey()).isPresent());
-        assertTrue(Files.size(cacheDirectory.resolve(split.getSliceKey() + ".parquet")) > 0);
+        assertTrue(diskStore.get(split.getCacheKey()).isPresent());
+        assertTrue(Files.size(cacheDirectory.resolve(split.getCacheKey().pathSegment() + ".parquet")) > 0);
         assertEquals(List.of("bigint", "varchar"), resolvedTypeNames);
     }
 
@@ -215,8 +220,8 @@ class CachingPageSourceProviderTest {
     void hitServesCachedPagesProjectedToRequestedOrder() throws IOException {
         Block rawA = byteBlock(1);
         Block rawB = byteBlock(2);
-        store.put("schema.table|p=1", List.of(new Page(rawA, rawB)), List.of("a", "b"), List.of("bigint", "bigint"));
-        CachingSplit split = split("schema.table|p=1");
+        store.put(sliceKey(), List.of(new Page(rawA, rawB)), List.of("a", "b"), List.of("bigint", "bigint"));
+        CachingSplit split = split();
 
         // Reversed request order must be projected back correctly; delegate is never touched
         ConnectorPageSource source = provider.createPageSource(
@@ -237,7 +242,7 @@ class CachingPageSourceProviderTest {
         // Delegate serves one page; consumer stops at isFinished() without polling the null
         Block rawA = byteBlock(1);
         delegate.pagesToServe = List.of(new Page(rawA, byteBlock(2)));
-        CachingSplit split = split("schema.table|p=1");
+        CachingSplit split = split();
 
         ConnectorPageSource source = provider.createPageSource(
                 null, null, split, new ConnectorTableHandle() {},
@@ -248,14 +253,14 @@ class CachingPageSourceProviderTest {
         assertTrue(source.isFinished());
         source.close();
 
-        assertTrue(store.get("schema.table|p=1").isPresent());
+        assertTrue(store.get(sliceKey()).isPresent());
     }
 
     @Test
     void closeBeforeFinishDiscardsPartialSlice() throws IOException {
         Block rawA = byteBlock(1);
         delegate.pagesToServe = List.of(new Page(rawA, byteBlock(2)), new Page(byteBlock(3), byteBlock(4)));
-        CachingSplit split = split("schema.table|p=1");
+        CachingSplit split = split();
 
         ConnectorPageSource source = provider.createPageSource(
                 null, null, split, new ConnectorTableHandle() {},
@@ -264,7 +269,7 @@ class CachingPageSourceProviderTest {
         source.getNextSourcePage();
         source.close();
 
-        assertTrue(store.get("schema.table|p=1").isEmpty());
+        assertTrue(store.get(sliceKey()).isEmpty());
         // Delegate still closed (connection returned)
         // (the source is a PopulatingPageSource wrapping the FixedPageSource delegate)
     }
@@ -272,7 +277,7 @@ class CachingPageSourceProviderTest {
     @Test
     void unknownRequestedColumnDegradesToDelegate() {
         delegate.pagesToServe = List.of();
-        CachingSplit split = split("schema.table|p=1");
+        CachingSplit split = split();
         ConnectorTableHandle callerTable = new ConnectorTableHandle() {};
 
         ConnectorPageSource source = provider.createPageSource(
@@ -308,13 +313,13 @@ class CachingPageSourceProviderTest {
         // Cap smaller than one page: everything is over cap from the first page
         InMemorySliceStore tinyStore = new InMemorySliceStore(1, null, null);
         CachingPageSourceProvider tinyProvider = new CachingPageSourceProvider(delegate, tinyStore);
-        CachingSplit split = split("schema.table|p=1");
+        CachingSplit split = split();
 
         ConnectorPageSource source = tinyProvider.createPageSource(
                 null, null, split, new ConnectorTableHandle() {},
                 Optional.empty(), List.of(columnA), DynamicFilter.EMPTY);
 
         drain(source);
-        assertTrue(tinyStore.get("schema.table|p=1").isEmpty());
+        assertTrue(tinyStore.get(sliceKey()).isEmpty());
     }
 }
