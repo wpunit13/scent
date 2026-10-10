@@ -4,7 +4,15 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
-export JAVA_HOME="${JAVA_HOME:-/Library/Java/JavaVirtualMachines/temurin-25.jdk/Contents/Home}"
+# JDK 25 is required. Honour an explicit JAVA_HOME, else discover one, then verify.
+if [ -z "${JAVA_HOME:-}" ]; then
+  JAVA_HOME="$(/usr/libexec/java_home -v 25 2>/dev/null || true)"
+fi
+if [ -z "${JAVA_HOME:-}" ] || ! "$JAVA_HOME/bin/javac" -version 2>&1 | grep -q 'javac 25'; then
+  echo "error: JDK 25 required; set JAVA_HOME to a JDK 25 install" >&2
+  exit 1
+fi
+export JAVA_HOME
 
 if [ "${1:-}" != "skip-build" ]; then
   echo "== mvn package (includes unit tests)"

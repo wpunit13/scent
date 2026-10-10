@@ -66,11 +66,9 @@ The MVP must support the following minimal flow:
 
 - Complete cache-hit scenario: SCENT identifies the required cached chunks and returns the data to Trino.
 
-- Partial cache-hit scenario: If only a subset of the required data is available in the cache, SCENT identifies the cached chunks and the missing data. Trino retrieves the cached data from SCENT and retrieves the missing data from the underlying data source. 
-
 - Cache-miss scenario: If the required data is not available in the cache, Trino retrieves the data from the underlying data source.
 
-- Cache population: Data retrieved from the underlying data source during a partial cache-hit or cache-miss is simultaneously written to SCENT, making it available for reuse by subsequent queries.
+- Cache population: Data retrieved from the underlying data source during a cache-miss is simultaneously written to SCENT, making it available for reuse by subsequent queries.
 
 - Trino combines the data retrieved from SCENT and the underlying data source, where applicable, and completes query execution using its existing execution engine.
 
@@ -164,8 +162,7 @@ Delegate plugins elsewhere on the cluster are unaffected. A delegate whose jars 
 # /etc/trino/catalog/cached_pg.properties
 connector.name=cache_wrapper
 delegate.connector.name=postgresql
-cache.shared.memory=true
-cache.storage.directory=/tmp/scent-cache
+cache.root=/tmp/scent-cache
 
 # Upstream connector credentials (passed through to the delegate)
 connection-url=jdbc:postgresql://postgres.production.internal:5432/analytics
@@ -174,11 +171,11 @@ connection-password=secure_password
 ```
 ### Trino Pages To Parquet Storage
 
-When `cache.shared.memory=true`, each completed in-memory slice is also written as a typed Parquet file under the configured `cache.storage.directory`. SCENT currently serves cache hits from each worker's in-memory cache; it does not load these Parquet files back on a cache miss.
+When `cache.root` is set, each completed in-memory slice is also written as a typed Parquet file under that directory. SCENT currently serves cache hits from each worker's in-memory cache; it does not load these Parquet files back on a cache miss.
 
 Every Trino node that should access the same Parquet files must mount the same shared filesystem at that directory. The e2e Compose deployment bind-mounts the host directory `e2e/cache` at `/tmp/scent-cache` on the coordinator and worker containers, so the Parquet files are directly visible in the project directory. For workers on multiple hosts, mount a shared filesystem (such as NFS) at the configured path on every host; a local host directory is not shared across hosts.
 
-If shared-memory caching is enabled without a valid `cache.storage.directory`, SCENT logs an error, keeps the in-memory cache enabled, and skips Parquet storage.
+If `cache.root` is unset or invalid, SCENT keeps the in-memory cache enabled and skips Parquet storage.
 
 ### Version lock
 

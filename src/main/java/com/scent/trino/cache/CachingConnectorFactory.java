@@ -87,15 +87,9 @@ public class CachingConnectorFactory implements ConnectorFactory {
     }
 
     private static Path parseStorageDirectory(Map<String, String> config) {
-        if (!Boolean.parseBoolean(config.getOrDefault("cache.shared.memory", "false"))) {
-            log.error("cache.shared.memory is not configured correctly");
-            return null;
-        }
-
-        String directory = config.get("cache.storage.directory");
+        String directory = config.get("cache.root");
 
         if (directory == null || directory.isBlank()) {
-            log.error("cache.shared.memory is enabled but cache.storage.directory is missing; Parquet storage is disabled");
             return null;
         }
 
@@ -103,7 +97,7 @@ public class CachingConnectorFactory implements ConnectorFactory {
             return Path.of(directory);
         }
         catch (InvalidPathException e) {
-            log.error("Invalid cache.storage.directory '{}'; Parquet storage is disabled", directory, e);
+            log.error("Invalid cache.root '{}'; Parquet storage is disabled", directory, e);
             return null;
         }
     }
