@@ -1,9 +1,12 @@
 package com.scent.trino.cache;
 
 import io.trino.spi.Page;
+import io.airlift.slice.Slices;
+import io.trino.spi.block.BlockBuilder;
 import io.trino.spi.block.ByteArrayBlock;
 import io.trino.spi.type.BigintType;
 import io.trino.spi.type.TypeManager;
+import io.trino.spi.type.VarcharType;
 import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.predicate.TupleDomain;
 import org.junit.jupiter.api.Test;
@@ -59,7 +62,7 @@ class InMemorySliceStoreTest {
 
         assertTrue(store.isParquetEnabled());
         assertTrue(store.get(key("slice")).isPresent());
-        assertTrue(Files.size(storageDirectory.resolve(key("slice").pathSegment() + ".parquet")) > 0);
+        assertTrue(Files.size(store.fileFor(key("slice"))) > 0);
     }
 
     @Test
@@ -74,7 +77,7 @@ class InMemorySliceStoreTest {
         store.put(key("oversized"), List.of(page), List.of("a"), List.of("bigint"));
 
         assertTrue(store.get(key("oversized")).isEmpty());
-        assertTrue(Files.notExists(storageDirectory.resolve(key("oversized").pathSegment() + ".parquet")));
+        assertTrue(Files.notExists(store.fileFor(key("oversized"))));
     }
 
     @Test
@@ -87,6 +90,38 @@ class InMemorySliceStoreTest {
 
         assertEquals(List.of(page), store.get(key("slice")).orElseThrow());
         assertEquals(page.getSizeInBytes(), store.totalBytes());
+    }
+
+    @Test
+    void freshStoreServesSliceFromDisk(@TempDir Path storageDirectory) throws IOException {
+        TypeManager typeManager = (TypeManager) java.lang.reflect.Proxy.newProxyInstance(
+                TypeManager.class.getClassLoader(),
+                new Class<?>[] {TypeManager.class},
+                (proxy, method, arguments) -> {
+                    if (!method.getName().equals("fromSqlType")) {
+                        return null;
+                    }
+                    return switch ((String) arguments[0]) {
+                        case "bigint" -> BigintType.BIGINT;
+                        case "varchar" -> VarcharType.VARCHAR;
+                        default -> null;
+                    };
+                });
+        BlockBuilder longBuilder = BigintType.BIGINT.createBlockBuilder(null, 1);
+        BigintType.BIGINT.writeLong(longBuilder, 42L);
+        BlockBuilder varBuilder = VarcharType.VARCHAR.createBlockBuilder(null, 1);
+        VarcharType.VARCHAR.writeSlice(varBuilder, Slices.utf8Slice("hello"));
+        Page original = new Page(longBuilder.build(), varBuilder.build());
+        InMemorySliceStore first = new InMemorySliceStore(1024 * 1024, typeManager, storageDirectory);
+        first.put(key("slice"), List.of(original), List.of("n", "v"), List.of("bigint", "varchar"));
+
+        // Fresh worker: empty memory, same directory on disk
+        InMemorySliceStore second = new InMemorySliceStore(1024 * 1024, typeManager, storageDirectory);
+        List<Page> loaded = second.get(key("slice")).orElseThrow();
+
+        assertEquals(1, loaded.size());
+        assertEquals(42L, BigintType.BIGINT.getLong(loaded.get(0).getBlock(0), 0));
+        assertEquals("hello", VarcharType.VARCHAR.getSlice(loaded.get(0).getBlock(1), 0).toStringUtf8());
     }
 
     @Test

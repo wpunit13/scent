@@ -28,36 +28,33 @@ class ParquetSliceWriterTest
     void requiresTypeManagerForTypedParquetSlices()
     {
         assertThrows(IllegalStateException.class, () -> ParquetSliceWriter.write(
-                "slice",
+                Path.of("unused", "slice.parquet"),
                 List.of(),
                 List.of(),
                 List.of(),
-                null,
-                Path.of("unused")));
+                null));
     }
 
     @Test
     void rejectsColumnAndTypeCountMismatch()
     {
         assertThrows(IllegalArgumentException.class, () -> ParquetSliceWriter.write(
-                "slice",
+                Path.of("unused", "slice.parquet"),
                 List.of(),
                 List.of("a"),
                 List.of(),
-                UNUSED_TYPE_MANAGER,
-                Path.of("unused")));
+                UNUSED_TYPE_MANAGER));
     }
 
     @Test
     void rejectsMissingColumnType()
     {
         assertThrows(IllegalArgumentException.class, () -> ParquetSliceWriter.write(
-                "slice",
+                Path.of("unused", "slice.parquet"),
                 List.of(),
                 List.of("a"),
                 Arrays.asList((String) null),
-                UNUSED_TYPE_MANAGER,
-                Path.of("unused")));
+                UNUSED_TYPE_MANAGER));
     }
 
     @Test
@@ -68,12 +65,11 @@ class ParquetSliceWriterTest
                 new ByteArrayBlock(1, Optional.empty(), new byte[] {2}));
 
         assertThrows(IllegalArgumentException.class, () -> ParquetSliceWriter.write(
-                "slice",
+                Path.of("unused", "slice.parquet"),
                 List.of(twoChannels),
                 List.of("a"),
                 List.of("bigint"),
-                UNUSED_TYPE_MANAGER,
-                Path.of("unused")));
+                UNUSED_TYPE_MANAGER));
     }
 
     @Test
@@ -85,12 +81,11 @@ class ParquetSliceWriterTest
                 (proxy, method, arguments) -> method.getName().equals("fromSqlType") ? BigintType.BIGINT : null);
 
         ParquetSliceWriter.write(
-                "slice",
+                cacheDirectory.resolve("slice.parquet"),
                 List.of(),
                 List.of("sales-region", "sales region", "2nd"),
                 List.of("bigint", "bigint", "bigint"),
-                typeManager,
-                cacheDirectory);
+                typeManager);
 
         assertTrue(Files.size(cacheDirectory.resolve("slice.parquet")) > 0);
     }

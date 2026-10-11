@@ -82,7 +82,7 @@ echo "== verification"
 check "passthrough count(*)=300"  300     "$(scalar 'SELECT count(*) FROM scent.public.metrics')"
 
 check "populate us-west partition" 100 "$(scalar "SELECT count(*) FROM scent.public.metrics WHERE region='us-west'")"
-west_parquet_files=$(docker compose exec -T trino-worker sh -c "find /tmp/scent-cache -type f -name '*us-west*.parquet' -print | grep -c . || true" | tr -d '\r')
+west_parquet_files=$(docker compose exec -T trino-worker sh -c "find /tmp/scent-cache -type f -path '*us-west*' -name '*.parquet' -print | grep -c . || true" | tr -d '\r')
 [ "${west_parquet_files:-0}" -ge 1 ] && west_parquet_files=1 || west_parquet_files=0
 check "us-west Parquet slice created" 1 "$west_parquet_files"
 
@@ -136,6 +136,20 @@ check "0-col count(*)=100"        100     "$(scalar "SELECT count(*) FROM scent.
 
 check "no-partition passthrough"  300     "$(scalar 'SELECT count(*) FROM scent.public.metrics')"
 pt=$(docker compose logs trino-coordinator 2>/dev/null | grep -c 'getSplits passthrough'); [ "$pt" -ge 1 ] && pt=1; check "passthrough logged" 1 "$pt"
+
+echo "== restart survival (ADR-011: persist, do not wipe)"
+before_misses=$(docker compose logs trino-worker 2>/dev/null | grep -c 'cache miss' || true)
+docker compose restart trino-worker > /dev/null 2>&1
+for _ in $(seq 1 40); do
+  if python3 run-query.py "SELECT count(*) FROM scent.public.metrics" >/dev/null 2>&1; then break; fi
+  sleep 5
+done
+check "restart: slice still served" 7425.0 "$(scalar "SELECT sum(value) FROM scent.public.metrics WHERE region='us-east'")"
+after_misses=$(docker compose logs trino-worker 2>/dev/null | grep -c 'cache miss' || true)
+[ "$after_misses" = "$before_misses" ] && no_new=1 || no_new=0
+check "restart: no source read" 1 "$no_new"
+disk_loads=$(docker compose logs trino-worker 2>/dev/null | grep -c 'loaded slice.*from Parquet' || true); [ "$disk_loads" -ge 1 ] && disk_loads=1 || disk_loads=0
+check "restart: slice loaded from disk" 1 "$disk_loads"
 
 echo "== Parquet files in the shared cache mount"
 find ./cache -type f -name '*.parquet' -exec ls -lh {} \;

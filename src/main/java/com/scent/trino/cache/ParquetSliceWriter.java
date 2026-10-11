@@ -25,17 +25,15 @@ import java.util.UUID;
 final class ParquetSliceWriter {
     private ParquetSliceWriter() {}
 
-    static void write(String key,
+    static void write(Path target,
             List<Page> pages,
             List<String> columnNames,
             List<String> typeNames,
-            TypeManager typeManager,
-            Path cacheDirectory) throws IOException {
+            TypeManager typeManager) throws IOException {
 
         validate(pages, columnNames, typeNames, typeManager);
-        Files.createDirectories(cacheDirectory);
-        Path target = cacheDirectory.resolve(key + ".parquet");
-        Path temporary = cacheDirectory.resolve("slice-" + UUID.randomUUID() + ".parquet.tmp");
+        Files.createDirectories(target.getParent());
+        Path temporary = target.getParent().resolve("slice-" + UUID.randomUUID() + ".parquet.tmp");
 
         try {
             List<Type> types = typeNames.stream()
@@ -67,7 +65,7 @@ final class ParquetSliceWriter {
 
         Configuration configuration = new Configuration(false);
         configuration.setClassLoader(ParquetSliceWriter.class.getClassLoader());
-        configuration.set("fs.file.impl", "org.apache.hadoop.fs.LocalFileSystem");
+        configuration.set("fs.file.impl", "org.apache.hadoop.fs.RawLocalFileSystem");
 
         try (ParquetWriter<GenericRecord> writer = AvroParquetWriter.<GenericRecord>builder(
                                      new org.apache.hadoop.fs.Path(

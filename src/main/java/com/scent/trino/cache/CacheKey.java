@@ -53,13 +53,29 @@ public final class CacheKey {
     }
 
     /**
-     * Filesystem-safe identity string, used for the parquet filename. ponytail: the partition half
-     * still uses TupleDomain.toString(), which is fragile across predicate-format changes; a
-     * structural rendering is a later concern.
+     * Filesystem-safe identity string, used for the parquet filename. Percent-encodes the
+     * characters Hadoop's URI-based path handling rejects. ponytail: the partition half still
+     * reflects TupleDomain.toString(); a structural rendering is a later concern.
      */
     public String pathSegment()
     {
-        return table + "|" + partition + "|" + version;
+        return encode(table + "|" + partition + "|" + version);
+    }
+
+    private static String encode(String value)
+    {
+        StringBuilder out = new StringBuilder(value.length() + 16);
+        for (int index = 0; index < value.length(); index++) {
+            char c = value.charAt(index);
+            if (c == '%' || c == '{' || c == '}' || c == '[' || c == ']' || c == '|'
+                    || c == ' ' || c == '?' || c == '#' || c == '"') {
+                out.append('%').append(String.format("%02X", (int) c));
+            }
+            else {
+                out.append(c);
+            }
+        }
+        return out.toString();
     }
 
     @Override

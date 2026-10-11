@@ -212,7 +212,7 @@ class CachingPageSourceProviderTest {
         drain(source);
 
         assertTrue(diskStore.get(split.getCacheKey()).isPresent());
-        assertTrue(Files.size(cacheDirectory.resolve(split.getCacheKey().pathSegment() + ".parquet")) > 0);
+        assertTrue(Files.size(diskStore.fileFor(split.getCacheKey())) > 0);
         assertEquals(List.of("bigint", "varchar"), resolvedTypeNames);
     }
 
