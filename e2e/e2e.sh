@@ -137,6 +137,11 @@ check "0-col count(*)=100"        100     "$(scalar "SELECT count(*) FROM scent.
 check "no-partition passthrough"  300     "$(scalar 'SELECT count(*) FROM scent.public.metrics')"
 pt=$(docker compose logs trino-coordinator 2>/dev/null | grep -c 'getSplits passthrough'); [ "$pt" -ge 1 ] && pt=1; check "passthrough logged" 1 "$pt"
 
+check "unconfigured table query"  hello    "$(scalar 'SELECT payload FROM scent.public.notes WHERE id=1')"
+notes_files=$(docker compose exec -T trino-worker sh -c "find /tmp/scent-cache -type f -path '*notes*' | grep -c . || true" | tr -d '\r')
+[ "${notes_files:-0}" = 0 ] && notes_uncached=1 || notes_uncached=0
+check "unconfigured table not cached" 1 "$notes_uncached"
+
 echo "== restart survival (ADR-011: persist, do not wipe)"
 before_misses=$(docker compose logs trino-worker 2>/dev/null | grep -c 'cache miss' || true)
 docker compose restart trino-worker > /dev/null 2>&1

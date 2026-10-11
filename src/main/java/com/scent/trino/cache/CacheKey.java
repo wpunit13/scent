@@ -4,9 +4,12 @@ import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.SchemaTableName;
+import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
 
+import java.util.Map;
 import java.util.Objects;
+import java.util.stream.Collectors;
 
 /**
  * Content-addressable identity of a cached slice: the table, the partition predicate that scopes
@@ -59,7 +62,25 @@ public final class CacheKey {
      */
     public String pathSegment()
     {
-        return encode(table + "|" + partition + "|" + version);
+        return encode(table + "|" + canonicalPartition() + "|" + version);
+    }
+
+    /**
+     * Canonical rendering of the partition domains, entries sorted by column so the on-disk
+     * layout is identical on every worker regardless of map iteration order (ADR-013). Matches
+     * TupleDomain.toString() for a single column, so existing layouts stay valid.
+     */
+    public String canonicalPartition()
+    {
+        Map<ColumnHandle, Domain> domains = partition.getDomains().orElse(Map.of());
+        if (domains.isEmpty()) {
+            return partition.toString();
+        }
+        String joined = domains.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey((a, b) -> a.toString().compareTo(b.toString())))
+                .map(entry -> entry.getKey() + "=" + entry.getValue())
+                .collect(Collectors.joining(", "));
+        return "{" + joined + "}";
     }
 
     private static String encode(String value)

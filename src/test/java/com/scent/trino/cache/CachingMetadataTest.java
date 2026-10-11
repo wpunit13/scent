@@ -16,6 +16,7 @@ import io.trino.spi.type.BigintType;
 import io.trino.spi.type.VarcharType;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -30,7 +31,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class CachingMetadataTest {
 
     private static final String PARTITION_COLUMN = "part";
+    private static final String PARTITION_COLUMN_2 = "part2";
+    private static final String TABLE_ID = "schema.table";
     private static final Domain PART = Domain.singleValue(BigintType.BIGINT, 1L);
+    private static final Domain PART2 = Domain.singleValue(BigintType.BIGINT, 3L);
     private static final Domain OTHER = Domain.singleValue(BigintType.BIGINT, 2L);
 
     private static final class StubMetadata implements ConnectorMetadata {
@@ -89,16 +93,30 @@ class CachingMetadataTest {
 
     private final StubMetadata stub = new StubMetadata();
     private final ColumnHandle partitionHandle = new ColumnHandle() {};
+    private final ColumnHandle partitionHandle2 = new ColumnHandle() {};
     private final ColumnHandle otherHandle = new ColumnHandle() {};
 
     private ConnectorMetadata metadata() {
         stub.columns = Map.of(PARTITION_COLUMN, partitionHandle, "other", otherHandle);
-        return CachingMetadata.wrap(stub, PARTITION_COLUMN, false);
+        return CachingMetadata.wrap(stub, Map.of(TABLE_ID, List.of(PARTITION_COLUMN)), false);
     }
 
     private ConnectorMetadata metadataWithColumnTypes() {
         stub.columns = Map.of(PARTITION_COLUMN, partitionHandle, "other", otherHandle);
-        return CachingMetadata.wrap(stub, PARTITION_COLUMN, true);
+        return CachingMetadata.wrap(stub, Map.of(TABLE_ID, List.of(PARTITION_COLUMN)), true);
+    }
+
+    private ConnectorMetadata multiColumnMetadata() {
+        stub.columns = Map.of(
+                PARTITION_COLUMN, partitionHandle,
+                PARTITION_COLUMN_2, partitionHandle2,
+                "other", otherHandle);
+        return CachingMetadata.wrap(stub, Map.of(TABLE_ID, List.of(PARTITION_COLUMN, PARTITION_COLUMN_2)), false);
+    }
+
+    private ConnectorMetadata unconfiguredMetadata() {
+        stub.columns = Map.of(PARTITION_COLUMN, partitionHandle, "other", otherHandle);
+        return CachingMetadata.wrap(stub, Map.of("other.schema.otherTable", List.of(PARTITION_COLUMN)), false);
     }
 
     private CachingTableHandle tableHandle(ConnectorMetadata metadata) {
@@ -279,5 +297,81 @@ class CachingMetadataTest {
         assertSame(foreign, stub.applyFilterHandle);
         assertTrue(result.isPresent());
         assertSame(stub.filteredHandle, result.get().getHandle());
+    }
+
+    @Test
+    void applyFilterPushesConjunctionOfAllConfiguredColumnsPresent() {
+        ConnectorMetadata metadata = multiColumnMetadata();
+        stub.filteredHandle = new ConnectorTableHandle() {};
+        stub.filterResult = Optional.of(new ConstraintApplicationResult<>(
+                stub.filteredHandle, TupleDomain.all(), Constant.TRUE, false));
+        CachingTableHandle wrapped = tableHandle(metadata);
+        metadata.getColumnHandles(null, wrapped);
+
+        Constraint constraint = new Constraint(withColumnDomains(Map.of(
+                partitionHandle, PART,
+                partitionHandle2, PART2,
+                otherHandle, OTHER)));
+        Optional<ConstraintApplicationResult<ConnectorTableHandle>> result =
+                metadata.applyFilter(null, wrapped, constraint);
+
+        assertTrue(result.isPresent());
+        // Delegate sees the conjunction of both grain columns
+        assertEquals(withColumnDomains(Map.of(partitionHandle, PART, partitionHandle2, PART2)),
+                stub.applyFilterConstraint.getSummary());
+        CachingTableHandle cached = assertInstanceOf(CachingTableHandle.class, result.get().getHandle());
+        assertEquals(withColumnDomains(Map.of(partitionHandle, PART, partitionHandle2, PART2)),
+                cached.getPartitionDomain());
+        // Remaining filter carries only the non-grain domain
+        assertEquals(withColumnDomains(Map.of(otherHandle, OTHER)), result.get().getRemainingFilter());
+    }
+
+    @Test
+    void applyFilterCachesPartialGrainWhenOnlyOneConfiguredColumnIsConstrained() {
+        ConnectorMetadata metadata = multiColumnMetadata();
+        stub.filteredHandle = new ConnectorTableHandle() {};
+        stub.filterResult = Optional.of(new ConstraintApplicationResult<>(
+                stub.filteredHandle, TupleDomain.all(), Constant.TRUE, false));
+        CachingTableHandle wrapped = tableHandle(metadata);
+        metadata.getColumnHandles(null, wrapped);
+
+        // Only the first grain column is constrained; the second stays in the remaining filter
+        Constraint constraint = new Constraint(withColumnDomains(Map.of(
+                partitionHandle, PART,
+                otherHandle, OTHER)));
+        Optional<ConstraintApplicationResult<ConnectorTableHandle>> result =
+                metadata.applyFilter(null, wrapped, constraint);
+
+        assertTrue(result.isPresent());
+        assertEquals(withColumnDomains(Map.of(partitionHandle, PART)), stub.applyFilterConstraint.getSummary());
+        CachingTableHandle cached = assertInstanceOf(CachingTableHandle.class, result.get().getHandle());
+        assertEquals(withColumnDomains(Map.of(partitionHandle, PART)), cached.getPartitionDomain());
+        // Remaining filter carries only what the query constrained and we did not push;
+        // part2 was never constrained, so it appears nowhere
+        assertEquals(withColumnDomains(Map.of(otherHandle, OTHER)), result.get().getRemainingFilter());
+    }
+
+    @Test
+    void unconfiguredTableForwardsFullConstraintEvenWhenFilterMatchesAColumn() {
+        ConnectorMetadata metadata = unconfiguredMetadata();
+        stub.filteredHandle = new ConnectorTableHandle() {};
+        TupleDomain<ColumnHandle> delegateRemaining = withColumnDomains(Map.of(otherHandle, OTHER));
+        stub.filterResult = Optional.of(new ConstraintApplicationResult<>(
+                stub.filteredHandle, delegateRemaining, Constant.TRUE, false));
+        CachingTableHandle wrapped = tableHandle(metadata);
+        metadata.getColumnHandles(null, wrapped);
+
+        Constraint constraint = new Constraint(withColumnDomains(Map.of(
+                partitionHandle, PART,
+                otherHandle, OTHER)));
+        Optional<ConstraintApplicationResult<ConnectorTableHandle>> result =
+                metadata.applyFilter(null, wrapped, constraint);
+
+        // Full constraint reaches the delegate untouched; nothing is cacheable
+        assertSame(constraint, stub.applyFilterConstraint);
+        assertTrue(result.isPresent());
+        CachingTableHandle cached = assertInstanceOf(CachingTableHandle.class, result.get().getHandle());
+        assertTrue(cached.getPartitionDomain().isAll());
+        assertEquals(delegateRemaining, result.get().getRemainingFilter());
     }
 }

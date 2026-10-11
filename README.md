@@ -83,7 +83,6 @@ The MVP must support the following minimal flow:
 | **Streaming data transfer** | Investigate streaming cached data from SCENT to Trino instead of transferring complete chunks. |
 | **Role-based access control** | Introduce role-based permissions to control who can access data. |
 | **Partition-filter enforcement** | Restrict or reject queries that do not provide appropriate partition filters to prevent inefficient or excessive data caching. |
-| **Configurable caching policies** | Allow users to configure which tables should be cached and define the appropriate partition-filter grain for each table. |
 | **Cache observability and analytics** | Provide dashboards and metrics for cache hit rate, miss rate, storage utilization, frequently accessed chunks, and query performance improvements. |
 
 ---
@@ -163,6 +162,12 @@ Delegate plugins elsewhere on the cluster are unaffected. A delegate whose jars 
 connector.name=cache_wrapper
 delegate.connector.name=postgresql
 cache.root=/tmp/scent-cache
+
+# Opt-in per table: the JSON array lists the columns whose filters define a cache slice
+# (for Oracle composite partitioning, list the partition and subpartition keys).
+# Tables without an entry are never cached.
+cache.partition-column.public.metrics=["region"]
+cache.partition-column.public.sales=["day", "region"]
 
 # Upstream connector credentials (passed through to the delegate)
 connection-url=jdbc:postgresql://postgres.production.internal:5432/analytics

@@ -38,7 +38,7 @@ Queue order: T16 (critical, next) → T15 (disk-only store, ADR-014) → Phase 4
 - [ ] T13: SIEVE eviction (ADR-010)
 - [ ] T14: Single-flight populate (D3)
 - [ ] T15: Disk-only store — FileSliceStore replaces the memory tier; populate streams to Parquet (ADR-014)
-- [ ] T16: Per-table partition columns (CRITICAL — next up; supersedes README out-of-scope entry)
+- [x] T16: Per-table partition columns (CRITICAL — supersedes README out-of-scope entry; ADR-013)
 
 ### Checkpoint: Complete
 - [ ] e2e covers restart survival, source outage, staleness, parallelism, reuse

@@ -16,7 +16,10 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -27,20 +30,20 @@ import static io.trino.spi.predicate.TupleDomain.withColumnDomains;
 @Slf4j
 public final class CachingMetadata implements InvocationHandler {
     private final ConnectorMetadata delegate;
-    private final String partitionColumn;
+    private final Map<String, List<String>> partitionColumnsByTable;
     private final boolean captureColumnTypes;
 
-    public CachingMetadata(ConnectorMetadata delegate, String partitionColumn, boolean captureColumnTypes) {
+    public CachingMetadata(ConnectorMetadata delegate, Map<String, List<String>> partitionColumnsByTable, boolean captureColumnTypes) {
         this.delegate = Objects.requireNonNull(delegate, "delegate is null");
-        this.partitionColumn = Objects.requireNonNull(partitionColumn, "partitionColumn is null");
+        this.partitionColumnsByTable = Objects.requireNonNull(partitionColumnsByTable, "partitionColumnsByTable is null");
         this.captureColumnTypes = captureColumnTypes;
     }
 
-    public static ConnectorMetadata wrap(ConnectorMetadata delegate, String partitionColumn, boolean captureColumnTypes) {
+    public static ConnectorMetadata wrap(ConnectorMetadata delegate, Map<String, List<String>> partitionColumnsByTable, boolean captureColumnTypes) {
         return (ConnectorMetadata) Proxy.newProxyInstance(
                 ConnectorMetadata.class.getClassLoader(),
                 new Class<?>[] {ConnectorMetadata.class},
-                new CachingMetadata(delegate, partitionColumn, captureColumnTypes));
+                new CachingMetadata(delegate, partitionColumnsByTable, captureColumnTypes));
     }
 
     /**
@@ -123,10 +126,17 @@ public final class CachingMetadata implements InvocationHandler {
         ConnectorSession session = (ConnectorSession) arguments[0];
         Constraint constraint = (Constraint) arguments[2];
         TupleDomain<ColumnHandle> summary = constraint.getSummary();
-        ColumnHandle partitionHandle = resolvePartitionHandle(session, caching);
+        List<ColumnHandle> partitionHandles = resolvePartitionHandles(session, caching);
 
-        TupleDomain<ColumnHandle> incomingPartition = partitionDomainFor(summary, partitionHandle);
+        TupleDomain<ColumnHandle> incomingPartition = partitionDomainFor(summary, partitionHandles);
         if (incomingPartition.isAll()) {
+            if (partitionColumnsByTable.containsKey(caching.getSchemaTableName().toString())) {
+                // Configured table, but none of its grain columns is constrained in this query.
+                log.debug("[SCENT SPI] none of the configured partition columns is constrained for {}; forwarding uncached", caching.getSchemaTableName());
+            }
+            else {
+                log.debug("[SCENT SPI] table {} has no configured partition columns; forwarding uncached", caching.getSchemaTableName());
+            }
             // No partition predicate in flight: forward the whole constraint so non-partition
             // predicates still reach the delegate, and keep whatever partition domain the
             // scan already carries (all() for a plain scan, so it stays uncached).
@@ -163,7 +173,7 @@ public final class CachingMetadata implements InvocationHandler {
                 caching.getColumnTypes());
         return Optional.of(new ConstraintApplicationResult<>(
                 wrapped,
-                withoutPartitionColumn(summary, partitionHandle),
+                withoutPartitionColumns(summary, partitionHandles),
                 // remaining domains are authoritative; TRUE is the sanctioned no-expression value
                 Constant.TRUE,
                 false));
@@ -192,29 +202,57 @@ public final class CachingMetadata implements InvocationHandler {
                 result.get().isPrecalculateStatistics()));
     }
 
-    private ColumnHandle resolvePartitionHandle(ConnectorSession session, CachingTableHandle caching) {
+    /**
+     * The configured grain columns of this table, resolved against the delegate's column handles.
+     * An unconfigured table, or a configured column the table does not have, contributes nothing.
+     */
+    private List<ColumnHandle> resolvePartitionHandles(ConnectorSession session, CachingTableHandle caching) {
+        List<String> configured = partitionColumnsByTable.getOrDefault(
+                caching.getSchemaTableName().toString(), List.of());
+        if (configured.isEmpty()) {
+            return List.of();
+        }
         Map<String, ColumnHandle> columns = delegate.getColumnHandles(session, caching.getDelegateHandle());
-        return columns.get(partitionColumn);
+        List<ColumnHandle> handles = new ArrayList<>();
+        for (String column : configured) {
+            ColumnHandle handle = columns.get(column);
+            if (handle != null) {
+                handles.add(handle);
+            }
+        }
+        return handles;
     }
 
     /**
-     * The partition column's slice of the summary, or all() when the partition column carries
-     * no predicate (unknown column, missing from this table, or simply unconstrained).
+     * The conjunction of the grain-column domains present in the summary, or all() when none of
+     * them is constrained (unknown column, missing from this table, or simply unconstrained).
+     * Partial grains are cached as coarser slices (ADR-013).
      */
-    private static TupleDomain<ColumnHandle> partitionDomainFor(TupleDomain<ColumnHandle> summary, ColumnHandle partitionHandle) {
-        if (partitionHandle == null) {
+    private static TupleDomain<ColumnHandle> partitionDomainFor(TupleDomain<ColumnHandle> summary, List<ColumnHandle> partitionHandles) {
+        if (partitionHandles.isEmpty()) {
             return TupleDomain.all();
         }
-        return summary.getDomains()
-                .flatMap(domains -> Optional.ofNullable(domains.get(partitionHandle)))
-                .map(domain -> withColumnDomains(Map.of(partitionHandle, domain)))
-                .orElseGet(TupleDomain::all);
+        Map<ColumnHandle, Domain> domains = summary.getDomains().orElse(null);
+        if (domains == null) {
+            return TupleDomain.all();
+        }
+        Map<ColumnHandle, Domain> present = new LinkedHashMap<>();
+        for (ColumnHandle handle : partitionHandles) {
+            Domain domain = domains.get(handle);
+            if (domain != null) {
+                present.put(handle, domain);
+            }
+        }
+        if (present.isEmpty()) {
+            return TupleDomain.all();
+        }
+        return withColumnDomains(present);
     }
 
-    private static TupleDomain<ColumnHandle> withoutPartitionColumn(TupleDomain<ColumnHandle> summary, ColumnHandle partitionHandle) {
+    private static TupleDomain<ColumnHandle> withoutPartitionColumns(TupleDomain<ColumnHandle> summary, List<ColumnHandle> partitionHandles) {
         Map<ColumnHandle, Domain> domains = summary.getDomains().orElseThrow();
         Map<ColumnHandle, Domain> remaining = new HashMap<>(domains);
-        remaining.remove(partitionHandle);
+        remaining.keySet().removeAll(partitionHandles);
         if (remaining.isEmpty()) {
             return TupleDomain.all();
         }

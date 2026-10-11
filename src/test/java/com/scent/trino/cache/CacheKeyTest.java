@@ -12,6 +12,7 @@ import java.util.Map;
 import static io.trino.spi.predicate.TupleDomain.withColumnDomains;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CacheKeyTest {
     private final ColumnHandle column = new ColumnHandle() {};
@@ -42,5 +43,32 @@ class CacheKeyTest {
     void defaultsVersionToNone()
     {
         assertEquals("none", CacheKey.of(new SchemaTableName("schema", "table"), partition()).getVersion());
+    }
+
+    @Test
+    void canonicalPartitionSortsColumnsForStableLayout()
+    {
+        ColumnHandle a = new ColumnHandle() {
+            @Override
+            public String toString() {
+                return "col-a";
+            }
+        };
+        ColumnHandle b = new ColumnHandle() {
+            @Override
+            public String toString() {
+                return "col-b";
+            }
+        };
+        Domain domainA = Domain.singleValue(BigintType.BIGINT, 1L);
+        Domain domainB = Domain.singleValue(BigintType.BIGINT, 2L);
+
+        CacheKey aFirst = new CacheKey(new SchemaTableName("schema", "table"), withColumnDomains(Map.of(a, domainA, b, domainB)), null);
+        CacheKey bFirst = new CacheKey(new SchemaTableName("schema", "table"), withColumnDomains(new java.util.LinkedHashMap<>(Map.of(b, domainB, a, domainA))), null);
+
+        // Same slice, different map insertion order: identical canonical rendering
+        assertEquals(aFirst.canonicalPartition(), bFirst.canonicalPartition());
+        assertTrue(aFirst.canonicalPartition().startsWith("{col-a="));
+        assertTrue(aFirst.canonicalPartition().contains("col-b="));
     }
 }

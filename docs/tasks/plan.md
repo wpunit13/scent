@@ -241,7 +241,7 @@ Lock scope and get a measurable yardstick before building more.
 1. **Partial cache-hit** — dropped. Whole-slice is the settled design (ADR-001). README updated in Task 3.
 2. **Shared vs local first** — build local mode through Phase 6; shared arrives later as a config toggle on
    the same `FileSliceStore`.
-3. **Docs tracking** — `docs/` stays gitignored (local-only); the plan and ADRs live under `docs/`, not in git.
+3. **Docs tracking** — reversed 2026-10-11: `docs/` is now tracked in git (ADRs, tracker, plan, arch).
 4. **Config naming** — align to ADR-006 (`cache.root` / `cache.shared`), renaming the earlier keys in Task 2.
 5. **Storage evolution (later)** — migrate the slice format from parquet-avro to `io.trino:trino-parquet` +
    `trino-filesystem` (verified available for 483). Removes ~68MB of hadoop jars (94% of the plugin zip) and

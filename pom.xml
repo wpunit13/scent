@@ -87,6 +87,14 @@
             <version>${hadoop.version}</version>
         </dependency>
 
+        <!-- Per-table partition-column config values are JSON arrays; parsed in the factory.
+             Version matches the jackson already bundled via avro. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.22.1</version>
+        </dependency>
+
         <dependency>
             <groupId>io.opentelemetry</groupId>
             <artifactId>opentelemetry-api</artifactId>

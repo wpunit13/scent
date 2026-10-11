@@ -93,7 +93,7 @@ public final class InMemorySliceStore {
     {
         return storageDirectory
                 .resolve(key.getTable().toString())
-                .resolve(key.getPartition().toString().replace('/', '_'))
+                .resolve(key.canonicalPartition().replace('/', '_'))
                 .resolve(key.getVersion() + ".parquet");
     }
 
