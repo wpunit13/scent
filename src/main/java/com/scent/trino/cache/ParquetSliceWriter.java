@@ -1,55 +1,69 @@
 package com.scent.trino.cache;
 
+import io.trino.parquet.writer.ParquetSchemaConverter;
+import io.trino.parquet.writer.ParquetWriter;
+import io.trino.parquet.writer.ParquetWriterOptions;
 import io.trino.spi.Page;
-import io.trino.spi.block.Block;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.TypeManager;
-import org.apache.avro.Schema;
-import org.apache.avro.generic.GenericData;
-import org.apache.avro.generic.GenericRecord;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.parquet.avro.AvroParquetWriter;
-import org.apache.parquet.hadoop.ParquetWriter;
-import org.apache.parquet.hadoop.metadata.CompressionCodecName;
+import io.trino.spi.type.VarcharType;
+import org.apache.parquet.format.CompressionCodec;
+import org.apache.parquet.schema.MessageType;
+import org.joda.time.DateTimeZone;
 
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 
+/** Writes Trino Pages using Trino's native Parquet writer. */
 final class ParquetSliceWriter {
     private ParquetSliceWriter() {}
 
-    static void write(Path target,
-            List<Page> pages,
+    static StreamingWriter open(Path target,
             List<String> columnNames,
             List<String> typeNames,
             TypeManager typeManager) throws IOException {
-
-        validate(pages, columnNames, typeNames, typeManager);
+        validate(columnNames, typeNames, typeManager);
         Files.createDirectories(target.getParent());
         Path temporary = target.getParent().resolve("slice-" + UUID.randomUUID() + ".parquet.tmp");
 
         try {
             List<Type> types = typeNames.stream()
                     .map(typeManager::fromSqlType)
+                    .map(ParquetSliceWriter::parquetType)
                     .toList();
 
             List<String> fieldNames = fieldNames(columnNames);
+            ParquetSchemaConverter converter = new ParquetSchemaConverter(types, fieldNames, false, false);
+            Converted schema = new Converted(converter.getMessageType(), converter.getPrimitiveTypes(), fieldNames);
 
-            Schema schema = TrinoParquetSchema.create(
-                            columnNames,
-                            fieldNames,
-                            typeNames,
-                            types);
-
-            writePages(temporary, pages, types, fieldNames, schema);
-            moveIntoPlace(temporary, target);
+            OutputStream output = Files.newOutputStream(temporary);
+            ParquetWriter writer;
+            try {
+                writer = new ParquetWriter(
+                            output,
+                            schema.messageType(),
+                            schema.primitiveTypes(),
+                            ParquetWriterOptions.builder().build(),
+                            CompressionCodec.GZIP,
+                            "SCENT / Trino " + com.scent.trino.BuildInfo.trinoVersion(),
+                            Optional.of(DateTimeZone.UTC),
+                            Optional.empty());
+            }
+            catch (RuntimeException e) {
+                output.close();
+                throw e;
+            }
+            return new StreamingWriter(writer, output, temporary, target, columnNames.size());
         }
         catch (RuntimeException | IOException e) {
             Files.deleteIfExists(temporary);
@@ -57,110 +71,130 @@ final class ParquetSliceWriter {
         }
     }
 
-    private static void writePages(Path temporary,
-            List<Page> pages,
-            List<Type> types,
-            List<String> fieldNames,
-            Schema schema) throws IOException {
+    static final class StreamingWriter implements AutoCloseable {
+        private final ParquetWriter writer;
+        private final OutputStream output;
+        private final Path temporary;
+        private final Path target;
+        private final int channelCount;
+        private boolean closed;
 
-        Configuration configuration = new Configuration(false);
-        configuration.setClassLoader(ParquetSliceWriter.class.getClassLoader());
-        configuration.set("fs.file.impl", "org.apache.hadoop.fs.RawLocalFileSystem");
+        private StreamingWriter(ParquetWriter writer, OutputStream output,
+                                Path temporary, Path target, int channelCount) {
+            this.writer = writer;
+            this.output = output;
+            this.temporary = temporary;
+            this.target = target;
+            this.channelCount = channelCount;
+        }
 
-        try (ParquetWriter<GenericRecord> writer = AvroParquetWriter.<GenericRecord>builder(
-                                     new org.apache.hadoop.fs.Path(
-                                             temporary.toUri()))
-                             .withSchema(schema)
-                             .withDataModel(GenericData.get())
-                             .withCompressionCodec(CompressionCodecName.GZIP)
-                             .withConf(configuration)
-                             .build()) {
-
-            for (Page page : pages) {
-                writePage(writer, page, types, fieldNames, schema);
+        void write(Page page) throws IOException {
+            if (closed) {
+                throw new IllegalStateException("Parquet slice writer is already closed");
             }
+            if (page.getChannelCount() != channelCount) {
+                throw new IllegalArgumentException("Page channel count does not match columns");
+            }
+            writer.write(page);
+        }
+
+        /*closed before attempting to close the underlying resources.
+        If writer.close() fails, the catch block attempts to close output and delete the temporary file. But it doesn't retry closing writer.
+        More importantly, closed now means that the StreamingWriter lifecycle has ended, not necessarily that all resources were successfully closed.*/
+        void complete() throws IOException {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            try {
+                writer.close();
+                output.close();
+                moveIntoPlace(temporary, target);
+            }
+            catch (RuntimeException | IOException e) {
+                try {
+                    output.close();
+                }
+                catch (IOException closeFailure) {
+                    e.addSuppressed(closeFailure);
+                }
+                try {
+                    Files.deleteIfExists(temporary);
+                }
+                catch (IOException deleteFailure) {
+                    e.addSuppressed(deleteFailure);
+                }
+                throw e;
+            }
+        }
+
+        void abort() throws IOException {
+            if (!closed) {
+                closed = true;
+                try {
+                    writer.close();
+                }
+                finally {
+                    try {
+                        output.close();
+                    }
+                    finally {
+                        Files.deleteIfExists(temporary);
+                    }
+                }
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            abort();
         }
     }
 
-    private static void writePage(
-            ParquetWriter<GenericRecord> writer,
-            Page page,
-            List<Type> types,
-            List<String> fieldNames,
-            Schema schema) throws IOException {
-        for (int position = 0; position < page.getPositionCount(); position++) {
-            GenericRecord row = new GenericData.Record(schema);
-            for (int channel = 0; channel < types.size(); channel++) {
-                Block block = page.getBlock(channel);
-                Object value = block.isNull(position)
-                        ? null
-                        : TrinoParquetValueConverter.convert(
-                        types.get(channel),
-                        schema.getFields().get(channel).schema(),
-                        block,
-                        position);
+    private static Type parquetType(Type type)
+    {
+        // Trino represents JSON values as slices; using Parquet's UTF-8 string mapping for them.
+        return type.getBaseName().equals("json") ? VarcharType.VARCHAR : type;
+    }
 
-                row.put(fieldNames.get(channel), value);
+    private static List<String> fieldNames(List<String> columnNames) {
+        List<String> fieldNames = new ArrayList<>();
+        Set<String> usedNames = new HashSet<>();
+        for (int index = 0; index < columnNames.size(); index++) {
+            String fieldName = columnNames.get(index).replaceAll("[^A-Za-z0-9_]", "_");
+            if (fieldName.isEmpty() || !Character.isLetter(fieldName.charAt(0)) && fieldName.charAt(0) != '_') {
+                fieldName = "_" + fieldName;
             }
-            writer.write(row);
+            if (!usedNames.add(fieldName)) {
+                fieldName += "_" + index;
+                while (!usedNames.add(fieldName)) {
+                    fieldName += "_";
+                }
+            }
+            fieldNames.add(fieldName);
         }
+        return List.copyOf(fieldNames);
     }
 
     private static void moveIntoPlace(Path temporary, Path target) throws IOException {
         try {
-            Files.move(temporary,
-                    target,
-                    StandardCopyOption.REPLACE_EXISTING,
-                    StandardCopyOption.ATOMIC_MOVE);
+            Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         }
         catch (java.nio.file.AtomicMoveNotSupportedException ignored) {
-            Files.move(temporary,
-                    target,
-                    StandardCopyOption.REPLACE_EXISTING);
+            Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING);
         }
     }
 
-    private static void validate(List<Page> pages,
-            List<String> columnNames,
+    private static void validate(List<String> columnNames,
             List<String> typeNames,
             TypeManager typeManager) {
         if (typeManager == null) {
             throw new IllegalStateException("TypeManager is required");
         }
-
-        if (columnNames.size() != typeNames.size()
-                || typeNames.stream().anyMatch(typeName -> typeName == null)) {
+        if (columnNames.size() != typeNames.size() || typeNames.stream().anyMatch(typeName -> typeName == null)) {
             throw new IllegalArgumentException("Column/type metadata is incomplete");
         }
-
-        for (Page page : pages) {
-            if (page.getChannelCount() != columnNames.size()) {
-                throw new IllegalArgumentException("Page channel count does not match columns");
-            }
-        }
     }
 
-    private static List<String> fieldNames(List<String> columnNames)
-    {
-        List<String> fieldNames = new ArrayList<>();
-        Set<String> usedNames = new HashSet<>();
-
-        for (int index = 0; index < columnNames.size(); index++) {
-            String columnName = columnNames.get(index);
-            String fieldName = columnName.replaceAll("[^A-Za-z0-9_]", "_");
-            if (fieldName.isEmpty() || !Character.isLetter(fieldName.charAt(0)) && fieldName.charAt(0) != '_') {
-                fieldName = "_" + fieldName;
-            }
-
-            String uniqueName = fieldName;
-            if (!usedNames.add(uniqueName)) {
-                uniqueName = fieldName + "_" + index;
-                while (!usedNames.add(uniqueName)) {
-                    uniqueName += "_";
-                }
-            }
-            fieldNames.add(uniqueName);
-        }
-        return fieldNames;
-    }
+    record Converted(MessageType messageType, Map<List<String>, Type> primitiveTypes, List<String> fieldNames) {}
 }

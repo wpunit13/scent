@@ -73,7 +73,7 @@ class CachingConnectorTest {
     @Test
     void forwardsShutdownToDelegate() {
         StubConnector stub = new StubConnector();
-        Connector connector = CachingConnector.wrap(stub, Map.of("s.t", List.of("part")), new InMemorySliceStore(1024 * 1024, null, null));
+        Connector connector = CachingConnector.wrap(stub, Map.of("s.t", List.of("part")), new FileSliceStore(1024 * 1024, null, null));
 
         connector.shutdown();
 
@@ -83,7 +83,7 @@ class CachingConnectorTest {
     @Test
     void wrapsSpiSubObjectsAndForwardsCalls() {
         StubConnector stub = new StubConnector();
-        Connector connector = CachingConnector.wrap(stub, Map.of("s.t", List.of("part")), new InMemorySliceStore(1024 * 1024, null, null));
+        Connector connector = CachingConnector.wrap(stub, Map.of("s.t", List.of("part")), new FileSliceStore(1024 * 1024, null, null));
 
         assertInstanceOf(CachingSplitManager.class, connector.getSplitManager());
         ConnectorPageSourceProviderFactory wrappedFactory = (ConnectorPageSourceProviderFactory) connector.getPageSourceProviderFactory();
@@ -101,7 +101,7 @@ class CachingConnectorTest {
         StubConnector stub = new StubConnector();
         TrinoException boom = new TrinoException(GENERIC_INTERNAL_ERROR, "boom");
         stub.failure = boom;
-        Connector connector = CachingConnector.wrap(stub, Map.of("s.t", List.of("part")), new InMemorySliceStore(1024 * 1024, null, null));
+        Connector connector = CachingConnector.wrap(stub, Map.of("s.t", List.of("part")), new FileSliceStore(1024 * 1024, null, null));
 
         assertSame(boom, assertThrows(TrinoException.class, connector::shutdown));
     }

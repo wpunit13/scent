@@ -11,12 +11,11 @@ import io.trino.spi.connector.ConnectorTableCredentials;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTransactionHandle;
 import io.trino.spi.connector.DynamicFilter;
-import io.trino.spi.connector.FixedPageSource;
 import io.trino.spi.connector.SourcePage;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
-import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -24,11 +23,11 @@ import java.util.Optional;
 @Slf4j
 public class CachingPageSourceProvider implements ConnectorPageSourceProvider {
     private final ConnectorPageSourceProvider delegate;
-    private final InMemorySliceStore sliceStore;
+    private final FileSliceStore sliceStore;
 
     public CachingPageSourceProvider(
             ConnectorPageSourceProvider delegate,
-            InMemorySliceStore sliceStore) {
+            FileSliceStore sliceStore) {
         this.delegate = Objects.requireNonNull(delegate, "delegate is null");
         this.sliceStore = Objects.requireNonNull(sliceStore, "sliceStore is null");
     }
@@ -45,10 +44,11 @@ public class CachingPageSourceProvider implements ConnectorPageSourceProvider {
         if (split instanceof CachingSplit caching) {
             int[] channels = channelsFor(columns, caching);
             if (channels != null) {
-                Optional<List<Page>> cached = sliceStore.get(caching.getCacheKey());
+                Optional<ConnectorPageSource> cached = sliceStore.openRead(
+                        caching.getCacheKey(), Arrays.stream(channels).boxed().toList(), caching.cachedChannelTypes());
                 if (cached.isPresent()) {
                     log.debug("[SCENT] cache hit for {}", caching.getCacheKey());
-                    return new FixedPageSource(project(cached.get(), channels));
+                    return cached.get();
                 }
                 log.debug("[SCENT] cache miss for {}, populating", caching.getCacheKey());
                 ConnectorPageSource source = delegate.createPageSource(
@@ -104,12 +104,6 @@ public class CachingPageSourceProvider implements ConnectorPageSourceProvider {
      * Projects cached pages to the requested channels. Blocks are shared, never copied:
      * Trino blocks are immutable once built.
      */
-    private static List<Page> project(List<Page> pages, int[] channels) {
-        return pages.stream()
-                .map(page -> projectPage(page, channels))
-                .toList();
-    }
-
     private static Page projectPage(Page page, int[] channels) {
         if (channels.length == 0) {
             return new Page(page.getPositionCount());
@@ -127,47 +121,57 @@ public class CachingPageSourceProvider implements ConnectorPageSourceProvider {
 
     /**
      * Streaming tee over the delegate read: emits requested-column pages to the engine while
-     * buffering the raw slice. The slice is published only on clean exhaustion; an early close
-     * (query cancel, error, limit) discards the partial buffer (C4).
+     * writing the raw slice to a temporary Parquet file. The file is published only on clean
+     * exhaustion; an early close or an oversized slice aborts the write.
      */
     private static final class PopulatingPageSource implements ConnectorPageSource {
         private final ConnectorPageSource delegate;
         private final CachingSplit split;
         private final int[] channels;
-        private final InMemorySliceStore sliceStore;
-        private final List<Page> buffer = new ArrayList<>();
-        private long bufferedBytes;
-        private boolean overCap;
+        private final FileSliceStore sliceStore;
+        private FileSliceStore.WriteSession writeSession;
+        private boolean cacheable;
         private boolean published;
 
         PopulatingPageSource(
                 ConnectorPageSource delegate,
                 CachingSplit split,
                 int[] channels,
-                InMemorySliceStore sliceStore) {
+                FileSliceStore sliceStore) {
             this.delegate = delegate;
             this.split = split;
             this.channels = channels;
             this.sliceStore = sliceStore;
+            this.cacheable = sliceStore.isEnabled();
+            if (cacheable) {
+                try {
+                    this.writeSession = sliceStore.beginWrite(
+                            split.getCacheKey(), split.cachedChannelNames(), split.cachedChannelTypes());
+                    cacheable = writeSession != null;
+                }
+                catch (Exception e) {
+                    cacheable = false;
+                    log.warn("[SCENT] failed to start slice write {}", split.getCacheKey(), e);
+                }
+            }
         }
 
         @Override
         public SourcePage getNextSourcePage() {
-            SourcePage raw = delegate.getNextSourcePage();
-            if (raw == null) {
-                publishIfComplete();
-                return null;
+            try {
+                SourcePage raw = delegate.getNextSourcePage();
+                if (raw == null) {
+                    publishIfComplete();
+                    return null;
+                }
+                appendToStore(raw.getPage());
+                return SourcePage.create(projectPage(raw.getPage(), channels));
             }
-            if (bufferedBytes + raw.getSizeInBytes() > sliceStore.maxBytes()) {
-                // ponytail: once over cap, drop the rest of the slice instead of evicting
-                // everything else to fit it; revisit only if large partitions matter.
-                overCap = true;
+            catch (RuntimeException | Error e) {
+                cacheable = false;
+                abortWriteSession();
+                throw e;
             }
-            else {
-                buffer.add(raw.getPage());
-                bufferedBytes += raw.getSizeInBytes();
-            }
-            return SourcePage.create(projectPage(raw.getPage(), channels));
         }
 
         @Override
@@ -185,29 +189,81 @@ public class CachingPageSourceProvider implements ConnectorPageSourceProvider {
         @Override
         public boolean isFinished()
         {
-            return delegate.isFinished();
+            try {
+                boolean finished = delegate.isFinished();
+                if (finished) {
+                    publishIfComplete();
+                }
+                return finished;
+            }
+            catch (RuntimeException | Error e) {
+                cacheable = false;
+                abortWriteSession();
+                throw e;
+            }
         }
 
         @Override
         public void close() throws IOException {
             // The engine may stop at isFinished() without polling the terminal null,
-            // so a completed buffer can publish here too; publishIfComplete is idempotent.
+            // so a completed slice can publish here too; publishIfComplete is idempotent.
             publishIfComplete();
-            if (!published && !overCap) {
-                log.debug("[SCENT] discarded partial slice {}", split.getCacheKey());
+            if (!published) {
+                abortWriteSession();
+                log.debug("[SCENT] discarded incomplete slice {}", split.getCacheKey());
             }
             delegate.close();
         }
 
         /**
-         * The delegate reports finished only after every page was consumed, so the buffer
+         * The delegate reports finished only after every page was consumed, so the slice
          * is complete exactly when this succeeds.
          */
         private void publishIfComplete() {
-            if (!published && !overCap && delegate.isFinished()) {
+            if (!published && delegate.isFinished()) {
                 published = true;
-                sliceStore.put(split.getCacheKey(), buffer, split.cachedChannelNames(), split.cachedChannelTypes());
-                log.debug("[SCENT] published slice {} ({} bytes)", split.getCacheKey(), bufferedBytes);
+                if (cacheable) {
+                    try {
+                        if (writeSession != null) {
+                            writeSession.complete();
+                            log.debug("[SCENT] published slice {}", split.getCacheKey());
+                        }
+                    }
+                    catch (Exception e) {
+                        log.warn("[SCENT] failed to publish slice {}", split.getCacheKey(), e);
+                        abortWriteSession();
+                    }
+                }
+            }
+        }
+
+        private void appendToStore(Page page) {
+            if (!cacheable) {
+                return;
+            }
+            try {
+                if (writeSession != null && !writeSession.write(page)) {
+                    cacheable = false;
+                    writeSession = null;
+                    log.debug("[SCENT] skipped oversized slice {} (limit {} bytes)", split.getCacheKey(), sliceStore.maxBytes());
+                }
+            }
+            catch (Exception e) {
+                log.warn("[SCENT] failed to write slice {}", split.getCacheKey(), e);
+                cacheable = false;
+                abortWriteSession();
+            }
+        }
+
+        private void abortWriteSession() {
+            if (writeSession != null) {
+                try {
+                    writeSession.abort();
+                }
+                catch (Exception e) {
+                    log.warn("[SCENT] failed to clean up temporary Parquet slice {}", split.getCacheKey(), e);
+                }
+                writeSession = null;
             }
         }
     }

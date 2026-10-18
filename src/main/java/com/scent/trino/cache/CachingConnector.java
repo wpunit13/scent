@@ -20,15 +20,15 @@ public final class CachingConnector implements InvocationHandler {
 
     private final Connector delegate;
     private final Map<String, List<String>> partitionColumnsByTable;
-    private final InMemorySliceStore sliceStore;
+    private final FileSliceStore sliceStore;
 
-    public CachingConnector(Connector delegate, Map<String, List<String>> partitionColumnsByTable, InMemorySliceStore sliceStore) {
+    public CachingConnector(Connector delegate, Map<String, List<String>> partitionColumnsByTable, FileSliceStore sliceStore) {
         this.delegate = Objects.requireNonNull(delegate, "delegate is null");
         this.partitionColumnsByTable = Objects.requireNonNull(partitionColumnsByTable, "partitionColumnsByTable is null");
         this.sliceStore = Objects.requireNonNull(sliceStore, "sliceStore is null");
     }
 
-    public static Connector wrap(Connector delegate, Map<String, List<String>> partitionColumnsByTable, InMemorySliceStore sliceStore) {
+    public static Connector wrap(Connector delegate, Map<String, List<String>> partitionColumnsByTable, FileSliceStore sliceStore) {
         return (Connector) Proxy.newProxyInstance(
                 Connector.class.getClassLoader(),
                 new Class<?>[] {Connector.class},
@@ -51,7 +51,7 @@ public final class CachingConnector implements InvocationHandler {
 
     private Object wrapResult(Method method, Object result) {
         return switch (method.getName()) {
-            case "getMetadata" -> CachingMetadata.wrap((ConnectorMetadata) result, partitionColumnsByTable, sliceStore.isParquetEnabled());
+            case "getMetadata" -> CachingMetadata.wrap((ConnectorMetadata) result, partitionColumnsByTable, sliceStore.isEnabled());
             case "getSplitManager" -> new CachingSplitManager((ConnectorSplitManager) result);
             case "getPageSourceProvider" -> new CachingPageSourceProvider((ConnectorPageSourceProvider) result, sliceStore);
             case "getPageSourceProviderFactory" -> {ConnectorPageSourceProviderFactory factory = (ConnectorPageSourceProviderFactory) result;

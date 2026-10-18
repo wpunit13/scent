@@ -75,7 +75,7 @@ public class CachingConnectorFactory implements ConnectorFactory {
                         delegateConfig,
                         context);
 
-        return CachingConnector.wrap(delegateConnector, partitionColumns, new InMemorySliceStore(cacheMaxBytes,
+        return CachingConnector.wrap(delegateConnector, partitionColumns, new FileSliceStore(cacheMaxBytes,
                         context.getTypeManager(),
                         storageDirectory));
     }

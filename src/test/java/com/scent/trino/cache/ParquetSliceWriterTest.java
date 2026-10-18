@@ -27,9 +27,8 @@ class ParquetSliceWriterTest
     @Test
     void requiresTypeManagerForTypedParquetSlices()
     {
-        assertThrows(IllegalStateException.class, () -> ParquetSliceWriter.write(
+        assertThrows(IllegalStateException.class, () -> ParquetSliceWriter.open(
                 Path.of("unused", "slice.parquet"),
-                List.of(),
                 List.of(),
                 List.of(),
                 null));
@@ -38,9 +37,8 @@ class ParquetSliceWriterTest
     @Test
     void rejectsColumnAndTypeCountMismatch()
     {
-        assertThrows(IllegalArgumentException.class, () -> ParquetSliceWriter.write(
+        assertThrows(IllegalArgumentException.class, () -> ParquetSliceWriter.open(
                 Path.of("unused", "slice.parquet"),
-                List.of(),
                 List.of("a"),
                 List.of(),
                 UNUSED_TYPE_MANAGER));
@@ -49,27 +47,29 @@ class ParquetSliceWriterTest
     @Test
     void rejectsMissingColumnType()
     {
-        assertThrows(IllegalArgumentException.class, () -> ParquetSliceWriter.write(
+        assertThrows(IllegalArgumentException.class, () -> ParquetSliceWriter.open(
                 Path.of("unused", "slice.parquet"),
-                List.of(),
                 List.of("a"),
                 Arrays.asList((String) null),
                 UNUSED_TYPE_MANAGER));
     }
 
     @Test
-    void rejectsPagesWithDifferentChannelCount()
+    void rejectsPagesWithDifferentChannelCount(@TempDir Path cacheDirectory) throws IOException
     {
         Page twoChannels = new Page(
                 new ByteArrayBlock(1, Optional.empty(), new byte[] {1}),
                 new ByteArrayBlock(1, Optional.empty(), new byte[] {2}));
 
-        assertThrows(IllegalArgumentException.class, () -> ParquetSliceWriter.write(
-                Path.of("unused", "slice.parquet"),
-                List.of(twoChannels),
-                List.of("a"),
-                List.of("bigint"),
-                UNUSED_TYPE_MANAGER));
+        TypeManager typeManager = (TypeManager) java.lang.reflect.Proxy.newProxyInstance(
+                TypeManager.class.getClassLoader(),
+                new Class<?>[] {TypeManager.class},
+                (proxy, method, arguments) -> method.getName().equals("fromSqlType") ? BigintType.BIGINT : null);
+
+        try (ParquetSliceWriter.StreamingWriter writer = ParquetSliceWriter.open(
+                cacheDirectory.resolve("slice.parquet"), List.of("a"), List.of("bigint"), typeManager)) {
+            assertThrows(IllegalArgumentException.class, () -> writer.write(twoChannels));
+        }
     }
 
     @Test
@@ -80,12 +80,13 @@ class ParquetSliceWriterTest
                 new Class<?>[] {TypeManager.class},
                 (proxy, method, arguments) -> method.getName().equals("fromSqlType") ? BigintType.BIGINT : null);
 
-        ParquetSliceWriter.write(
+        try (ParquetSliceWriter.StreamingWriter writer = ParquetSliceWriter.open(
                 cacheDirectory.resolve("slice.parquet"),
-                List.of(),
                 List.of("sales-region", "sales region", "2nd"),
                 List.of("bigint", "bigint", "bigint"),
-                typeManager);
+                typeManager)) {
+            writer.complete();
+        }
 
         assertTrue(Files.size(cacheDirectory.resolve("slice.parquet")) > 0);
     }
