@@ -1,180 +1,193 @@
 package com.scent.trino.cache;
 
-import io.trino.spi.Page;
-import io.trino.spi.block.Block;
-import io.trino.spi.block.BlockBuilder;
-import io.trino.spi.type.DecimalType;
-import io.trino.spi.type.RealType;
+import com.scent.trino.exceptions.ParquetSchemaMismatchException;
+import com.google.common.collect.ImmutableList;
+import io.trino.memory.context.AggregatedMemoryContext;
+import io.trino.parquet.AbstractParquetDataSource;
+import io.trino.parquet.Column;
+import io.trino.parquet.Field;
+import io.trino.parquet.ParquetDataSourceId;
+import io.trino.parquet.ParquetReaderOptions;
+import io.trino.parquet.ParquetTypeUtils;
+import io.trino.parquet.metadata.BlockMetadata;
+import io.trino.parquet.metadata.FileMetadata;
+import io.trino.parquet.metadata.ParquetMetadata;
+import io.trino.parquet.metadata.PrunedBlockMetadata;
+import io.trino.parquet.reader.MetadataReader;
+import io.trino.parquet.reader.ParquetReader;
+import io.trino.parquet.reader.RowGroupInfo;
+import io.trino.parquet.writer.ParquetSchemaConverter;
+import io.trino.spi.connector.ConnectorPageSource;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.TypeManager;
-import io.airlift.slice.Slices;
-import org.apache.avro.Schema;
-import org.apache.avro.generic.GenericRecord;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.parquet.avro.AvroParquetReader;
-import org.apache.parquet.hadoop.ParquetReader;
+import io.trino.spi.type.VarcharType;
+import org.apache.parquet.io.ColumnIO;
+import org.apache.parquet.io.MessageColumnIO;
+import org.apache.parquet.schema.GroupType;
+import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.schema.PrimitiveType;
+import org.joda.time.DateTimeZone;
 
+import java.io.EOFException;
 import java.io.IOException;
-import java.math.BigDecimal;
-import java.math.BigInteger;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Path;
-import java.time.Instant;
-import java.time.LocalDate;
-import java.time.LocalTime;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
 
-/**
- * Inverse of {@link ParquetSliceWriter}: reads a slice's Parquet file back into pages in the
- * cached layout order. The file is self-describing: the writer embedded each column's Trino
- * type name as a schema prop, so the reader needs no type information from the caller.
- */
+/** Streams selected Trino columns from a native Parquet slice. */
 final class ParquetSliceReader {
-    /** Rows per rebuilt page; keeps a large slice from coming back as one giant page. */
-    private static final int PAGE_ROWS = 8192;
-
     private ParquetSliceReader() {}
 
-    static List<Page> read(Path file, TypeManager typeManager) throws IOException {
-        Configuration configuration = new Configuration(false);
-        configuration.setClassLoader(ParquetSliceReader.class.getClassLoader());
-        configuration.set("fs.file.impl", "org.apache.hadoop.fs.RawLocalFileSystem");
+    static ConnectorPageSource open(Path file, List<Integer> channelIndexes, List<String> allTypeNames, TypeManager typeManager)
+            throws IOException {
+        LocalParquetDataSource dataSource = new LocalParquetDataSource(file);
+        AggregatedMemoryContext memoryContext = AggregatedMemoryContext.newSimpleAggregatedMemoryContext();
+        try {
+            ParquetMetadata metadata = MetadataReader.readFooter(
+                    dataSource,
+                    ParquetReaderOptions.defaultOptions(),
+                    Optional.empty(),
+                    Optional.empty());
+            FileMetadata fileMetadata = metadata.getFileMetaData();
+            MessageType schema = fileMetadata.getSchema();
+            MessageColumnIO messageColumnIO = ParquetTypeUtils.getColumnIO(schema, schema);
+            List<Column> columns = createColumns(schema, messageColumnIO, channelIndexes, allTypeNames, typeManager);
 
-        List<Page> pages = new ArrayList<>();
-        try (ParquetReader<GenericRecord> reader = AvroParquetReader.<GenericRecord>builder(
-                new org.apache.hadoop.fs.Path(file.toUri())).withConf(configuration).build()) {
-
-            GenericRecord record = reader.read();
-            if (record == null) {
-                return pages;
+            var descriptors = ParquetTypeUtils.getDescriptors(schema, schema);
+            ImmutableList.Builder<RowGroupInfo> rowGroups = ImmutableList.builder();
+            long rowOffset = 0;
+            for (BlockMetadata block : metadata.getBlocks()) {
+                PrunedBlockMetadata pruned = PrunedBlockMetadata.createPrunedColumnsMetadata(
+                        block, dataSource.getId(), descriptors);
+                rowGroups.add(new RowGroupInfo(pruned, rowOffset, Optional.empty()));
+                rowOffset += block.rowCount();
             }
 
-            Schema schema = record.getSchema();
-            int channels = schema.getFields().size();
-            List<Type> types = new ArrayList<>(channels);
-            for (Schema.Field field : schema.getFields()) {
-                types.add(typeManager.fromSqlType(field.getProp("trino.type")));
+            ParquetReader reader = new ParquetReader(
+                    Optional.ofNullable(fileMetadata.getCreatedBy()),
+                    columns,
+                    false,
+                    rowGroups.build(),
+                    dataSource,
+                    DateTimeZone.UTC,
+                    memoryContext,
+                    ParquetReaderOptions.defaultOptions(),
+                    exception -> exception instanceof RuntimeException runtimeException
+                            ? runtimeException
+                            : new RuntimeException(exception),
+                    Optional.empty(),
+                    Optional.empty(),
+                    Optional.empty());
+            return new ParquetSlicePageSource(reader, dataSource, memoryContext);
+        }
+        catch (IOException | RuntimeException | Error e) {
+            try {
+                dataSource.close();
             }
+            catch (IOException closeFailure) {
+                e.addSuppressed(closeFailure);
+            }
+            memoryContext.close();
+            throw e;
+        }
+    }
 
-            BlockBuilder[] builders = builders(types, PAGE_ROWS);
-            int positions = 0;
-            do {
-                for (int channel = 0; channel < channels; channel++) {
-                    append(builders[channel], types.get(channel), record.get(channel));
+    private static Type parquetType(Type type) {
+        return type.getBaseName().equals("json") ? VarcharType.VARCHAR : type;
+    }
+
+    private static List<Column> createColumns(
+            MessageType schema,
+            MessageColumnIO messageColumnIO,
+            List<Integer> channelIndexes,
+            List<String> allTypeNames,
+            TypeManager typeManager)
+            throws IOException {
+        List<org.apache.parquet.schema.Type> schemaFields = schema.getFields();
+        List<Column> columns = new ArrayList<>(channelIndexes.size());
+        for (int channelIndex : channelIndexes) {
+            if (channelIndex < 0 || channelIndex >= schemaFields.size()) {
+                throw new IllegalArgumentException("Cached channel index is outside the Parquet schema: " + channelIndex);
+            }
+            org.apache.parquet.schema.Type schemaField = schemaFields.get(channelIndex);
+            String fieldName = schemaField.getName();
+            if (channelIndex >= allTypeNames.size() || allTypeNames.get(channelIndex) == null) {
+                throw new IllegalArgumentException("Trino type metadata is missing for cached channel " + channelIndex);
+            }
+            String typeName = allTypeNames.get(channelIndex);
+            Type type = parquetType(typeManager.fromSqlType(typeName));
+            MessageType expectedSchema = new ParquetSchemaConverter(List.of(type), List.of(fieldName), false, false).getMessageType();
+            if (!matchesParquetType(expectedSchema.getType(0), schemaField)) {
+                throw new ParquetSchemaMismatchException("Stored Trino type " + typeName + " does not match Parquet field " + fieldName +
+                        " (expected " + expectedSchema.getType(0) + ", found " + schemaField + ")");
+            }
+            ColumnIO columnIO = ParquetTypeUtils.lookupColumnByName(messageColumnIO, fieldName);
+            Field field = ParquetTypeUtils.constructField(type, columnIO)
+                    .orElseThrow(() -> new IllegalArgumentException("Unsupported Parquet field: " + fieldName));
+            columns.add(new Column(fieldName, field));
+        }
+        return columns;
+    }
+
+    private static boolean matchesParquetType(org.apache.parquet.schema.Type expected, org.apache.parquet.schema.Type actual) {
+        if (!expected.getName().equalsIgnoreCase(actual.getName()) || expected.isPrimitive() != actual.isPrimitive()) {
+            return false;
+        }
+        if (expected.isPrimitive()) {
+            PrimitiveType expectedPrimitive = expected.asPrimitiveType();
+            PrimitiveType actualPrimitive = actual.asPrimitiveType();
+            return expectedPrimitive.getPrimitiveTypeName() == actualPrimitive.getPrimitiveTypeName() &&
+                    Objects.equals(expectedPrimitive.getLogicalTypeAnnotation(), actualPrimitive.getLogicalTypeAnnotation()) &&
+                    (expectedPrimitive.getPrimitiveTypeName() != PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY ||
+                            expectedPrimitive.getTypeLength() == actualPrimitive.getTypeLength());
+        }
+
+        GroupType expectedGroup = expected.asGroupType();
+        GroupType actualGroup = actual.asGroupType();
+        if (!Objects.equals(expectedGroup.getLogicalTypeAnnotation(), actualGroup.getLogicalTypeAnnotation()) ||
+                expectedGroup.getFieldCount() != actualGroup.getFieldCount()) {
+            return false;
+        }
+        for (int field = 0; field < expectedGroup.getFieldCount(); field++) {
+            if (!matchesParquetType(expectedGroup.getType(field), actualGroup.getType(field))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static final class LocalParquetDataSource extends AbstractParquetDataSource {
+        private final FileChannel channel;
+
+        private LocalParquetDataSource(Path file) throws IOException {
+            super(new ParquetDataSourceId(file.toString()), java.nio.file.Files.size(file), ParquetReaderOptions.defaultOptions());
+            channel = FileChannel.open(file, StandardOpenOption.READ);
+        }
+
+        @Override
+        protected void readInternal(long position, byte[] buffer, int bufferOffset, int length) throws IOException {
+            ByteBuffer target = ByteBuffer.wrap(buffer, bufferOffset, length);
+            long currentPosition = position;
+            while (target.hasRemaining()) {
+                int bytesRead = channel.read(target, currentPosition);
+                if (bytesRead < 0) {
+                    throw new EOFException("Unexpected end of Parquet file at offset " + currentPosition);
                 }
-                if (++positions == PAGE_ROWS) {
-                    pages.add(page(builders));
-                    builders = builders(types, PAGE_ROWS);
-                    positions = 0;
+                if (bytesRead == 0) {
+                    continue;
                 }
-            }
-            while ((record = reader.read()) != null);
-            if (positions > 0) {
-                pages.add(page(builders));
+                currentPosition += bytesRead;
             }
         }
-        return pages;
-    }
 
-    private static BlockBuilder[] builders(List<Type> types, int expectedRows)
-    {
-        BlockBuilder[] builders = new BlockBuilder[types.size()];
-        for (int channel = 0; channel < types.size(); channel++) {
-            builders[channel] = types.get(channel).createBlockBuilder(null, expectedRows);
+        @Override
+        public void close() throws IOException {
+            channel.close();
         }
-        return builders;
-    }
-
-    private static Page page(BlockBuilder[] builders)
-    {
-        Block[] blocks = new Block[builders.length];
-        for (int channel = 0; channel < builders.length; channel++) {
-            blocks[channel] = builders[channel].build();
-        }
-        return new Page(blocks);
-    }
-
-    private static void append(BlockBuilder builder, Type type, Object value)
-    {
-        if (value == null) {
-            builder.appendNull();
-            return;
-        }
-        switch (type.getBaseName()) {
-            case "boolean" -> type.writeBoolean(builder, (Boolean) value);
-
-            case "tinyint", "smallint", "integer" -> type.writeLong(builder, ((Number) value).longValue());
-
-            case "date" -> type.writeLong(builder, days(value));
-
-            case "bigint" -> type.writeLong(builder, ((Number) value).longValue());
-
-            case "time" -> type.writeLong(builder, microsOfDay(value));
-
-            case "timestamp" -> type.writeLong(builder, epochMicros(value));
-
-            case "real" -> ((RealType) type).writeFloat(builder, (Float) value);
-
-            case "double" -> type.writeDouble(builder, (Double) value);
-
-            case "varchar", "char", "json" -> type.writeSlice(builder, Slices.utf8Slice(value.toString()));
-
-            case "varbinary" -> type.writeSlice(builder, Slices.wrappedBuffer(bytes((ByteBuffer) value)));
-
-            case "decimal" -> {
-                if (!(type instanceof DecimalType decimalType)) {
-                    throw new IllegalArgumentException("Unsupported Trino type: " + type.getDisplayName());
-                }
-                if (!decimalType.isShort()) {
-                    throw new IllegalArgumentException("Long decimal not yet supported: " + type.getDisplayName());
-                }
-                type.writeObject(builder, decimal(value, decimalType));
-            }
-
-            default -> throw new IllegalArgumentException("Unsupported Trino type: " + type.getDisplayName());
-        }
-    }
-
-    /** Avro's GenericData converts logical types on read; the writer stored raw Trino longs. */
-    private static long days(Object value)
-    {
-        if (value instanceof LocalDate date) {
-            return date.toEpochDay();
-        }
-        return ((Number) value).longValue();
-    }
-
-    private static long epochMicros(Object value)
-    {
-        if (value instanceof Instant instant) {
-            return Math.multiplyExact(instant.getEpochSecond(), 1_000_000L) + instant.getNano() / 1000;
-        }
-        return ((Number) value).longValue();
-    }
-
-    private static long microsOfDay(Object value)
-    {
-        if (value instanceof LocalTime time) {
-            return time.toNanoOfDay() / 1000;
-        }
-        return ((Number) value).longValue();
-    }
-
-    private static BigDecimal decimal(Object value, DecimalType type)
-    {
-        if (value instanceof BigDecimal decimal) {
-            return decimal;
-        }
-        return new BigDecimal(new BigInteger(bytes((ByteBuffer) value)), type.getScale());
-    }
-
-    /** Exact copy of the buffer's remaining bytes as an array. */
-    private static byte[] bytes(ByteBuffer buffer)
-    {
-        ByteBuffer duplicate = buffer.duplicate();
-        byte[] bytes = new byte[duplicate.remaining()];
-        duplicate.get(bytes);
-        return bytes;
     }
 }

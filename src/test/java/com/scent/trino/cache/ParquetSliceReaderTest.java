@@ -1,18 +1,15 @@
 package com.scent.trino.cache;
 
+import io.airlift.slice.Slices;
 import io.trino.spi.Page;
-import io.trino.spi.block.Block;
 import io.trino.spi.block.BlockBuilder;
+import io.trino.spi.connector.ConnectorPageSource;
+import io.trino.spi.connector.SchemaTableName;
+import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.type.BigintType;
 import io.trino.spi.type.BooleanType;
-import io.trino.spi.type.DateType;
 import io.trino.spi.type.DoubleType;
-import io.trino.spi.type.IntegerType;
-import io.trino.spi.type.RealType;
-import io.trino.spi.type.TimestampType;
-import io.trino.spi.type.Type;
 import io.trino.spi.type.TypeManager;
-import io.trino.spi.type.VarbinaryType;
 import io.trino.spi.type.VarcharType;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -20,26 +17,15 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ParquetSliceReaderTest {
-
-    private static final List<Type> TYPES = List.of(
-            BooleanType.BOOLEAN,
-            IntegerType.INTEGER,
-            BigintType.BIGINT,
-            RealType.REAL,
-            DoubleType.DOUBLE,
-            VarcharType.VARCHAR,
-            DateType.DATE,
-            TimestampType.TIMESTAMP_MICROS,
-            VarbinaryType.VARBINARY);
-    private static final List<String> NAMES = List.of("b", "i", "l", "r", "d", "v", "dt", "ts", "vb");
-
+    private static final int PAGE_ROWS = 8192;
     private static final TypeManager TYPE_MANAGER = (TypeManager) java.lang.reflect.Proxy.newProxyInstance(
             TypeManager.class.getClassLoader(),
             new Class<?>[] {TypeManager.class},
@@ -48,94 +34,141 @@ class ParquetSliceReaderTest {
                     return null;
                 }
                 return switch ((String) arguments[0]) {
-                    case "boolean" -> BooleanType.BOOLEAN;
-                    case "integer" -> IntegerType.INTEGER;
                     case "bigint" -> BigintType.BIGINT;
-                    case "real" -> RealType.REAL;
-                    case "double" -> DoubleType.DOUBLE;
                     case "varchar" -> VarcharType.VARCHAR;
-                    case "date" -> DateType.DATE;
-                    case "timestamp" -> TimestampType.TIMESTAMP_MICROS;
-                    case "varbinary" -> VarbinaryType.VARBINARY;
-                    default -> null;
+                    case "boolean" -> BooleanType.BOOLEAN;
+                    case "double" -> DoubleType.DOUBLE;
+                    default -> throw new IllegalArgumentException("Unexpected type: " + arguments[0]);
                 };
             });
 
-    /** Builds a page where position 2 is null in every column and other positions hold per-type values. */
-    private static Page sample(int positions)
-    {
-        BlockBuilder[] builders = new BlockBuilder[TYPES.size()];
-        for (int channel = 0; channel < TYPES.size(); channel++) {
-            builders[channel] = TYPES.get(channel).createBlockBuilder(null, positions);
-        }
+    private static CacheKey cacheKey(String tableName) {
+        return CacheKey.of(new SchemaTableName("schema", tableName), TupleDomain.all());
+    }
+
+    private static Page bigintPage(int positions) {
+        BlockBuilder builder = BigintType.BIGINT.createBlockBuilder(null, positions);
         for (int position = 0; position < positions; position++) {
-            for (int channel = 0; channel < TYPES.size(); channel++) {
-                BlockBuilder builder = builders[channel];
-                if (position % 3 == 2) {
-                    builder.appendNull();
-                }
-                else {
-                    append(builder, TYPES.get(channel), position);
-                }
-            }
+            BigintType.BIGINT.writeLong(builder, position);
         }
-        Block[] blocks = new Block[TYPES.size()];
-        for (int channel = 0; channel < TYPES.size(); channel++) {
-            blocks[channel] = builders[channel].build();
-        }
-        return new Page(blocks);
+        return new Page(builder.build());
     }
 
-    private static void append(BlockBuilder builder, Type type, int position)
-    {
-        switch (type.getBaseName()) {
-            case "boolean" -> type.writeBoolean(builder, position % 2 == 0);
-            case "integer" -> type.writeLong(builder, position);
-            case "bigint" -> type.writeLong(builder, position * 1_000_000L);
-            case "real" -> ((RealType) type).writeFloat(builder, position * 1.5f);
-            case "double" -> type.writeDouble(builder, position * 2.5);
-            case "varchar" -> type.writeSlice(builder, io.airlift.slice.Slices.utf8Slice("row-" + position));
-            case "date" -> type.writeLong(builder, position);
-            case "timestamp" -> type.writeLong(builder, position * 1_000L);
-            case "varbinary" -> type.writeSlice(builder, io.airlift.slice.Slices.utf8Slice("bin-" + position));
-            default -> throw new IllegalStateException("unexpected type " + type.getDisplayName());
+    private static Page mixedPage() {
+        BlockBuilder bigint = BigintType.BIGINT.createBlockBuilder(null, 1);
+        BigintType.BIGINT.writeLong(bigint, 42);
+        BlockBuilder varchar = VarcharType.VARCHAR.createBlockBuilder(null, 1);
+        VarcharType.VARCHAR.writeSlice(varchar, Slices.utf8Slice("cached"));
+        BlockBuilder bool = BooleanType.BOOLEAN.createBlockBuilder(null, 1);
+        BooleanType.BOOLEAN.writeBoolean(bool, true);
+        BlockBuilder doubleValue = DoubleType.DOUBLE.createBlockBuilder(null, 1);
+        DoubleType.DOUBLE.writeDouble(doubleValue, 3.5);
+        return new Page(bigint.build(), varchar.build(), bool.build(), doubleValue.build());
+    }
+
+    private static List<Page> drain(ConnectorPageSource source) throws IOException {
+        List<Page> pages = new ArrayList<>();
+        try {
+            while (true) {
+                var next = source.getNextSourcePage();
+                if (next == null) {
+                    return pages;
+                }
+                pages.add(next.getPage());
+            }
+        }
+        finally {
+            source.close();
         }
     }
 
     @Test
-    void roundTripPreservesRowsAcrossAllSupportedTypes(@TempDir Path cacheDirectory) throws IOException
-    {
-        Page original = sample(25);
-        ParquetSliceWriter.write(cacheDirectory.resolve("roundtrip.parquet"), List.of(original), NAMES,
-                TYPES.stream().map(Type::getBaseName).toList(), TYPE_MANAGER);
-
-        List<Page> read = ParquetSliceReader.read(
-                cacheDirectory.resolve("roundtrip.parquet"), TYPE_MANAGER);
-
-        assertEquals(1, read.size());
-        Page back = read.get(0);
-        assertEquals(original.getPositionCount(), back.getPositionCount());
-        assertEquals(TYPES.size(), back.getChannelCount());
-
-        for (int channel = 0; channel < TYPES.size(); channel++) {
-            Type type = TYPES.get(channel);
-            Block originalBlock = original.getBlock(channel);
-            Block readBlock = back.getBlock(channel);
-            for (int position = 0; position < original.getPositionCount(); position++) {
-                assertEquals(type.getObjectValue(originalBlock, position),
-                        type.getObjectValue(readBlock, position),
-                        "channel " + channel + " (" + type.getBaseName() + ") position " + position);
-            }
+    void streamsRowsInChunksOfAtMost8192(@TempDir Path directory) throws IOException {
+        Path file = directory.resolve("many-rows.parquet");
+        try (ParquetSliceWriter.StreamingWriter writer = ParquetSliceWriter.open(
+                file, List.of("n"), List.of("bigint"), TYPE_MANAGER)) {
+            writer.write(bigintPage(PAGE_ROWS + 17));
+            writer.complete();
         }
+
+        List<Page> pages = drain(ParquetSliceReader.open(file, List.of(0), List.of("bigint"), TYPE_MANAGER));
+
+        long nextExpectedValue = 0;
+        int totalRows = 0;
+        for (Page page : pages) {
+            assertTrue(page.getPositionCount() <= PAGE_ROWS, "emitted page must not exceed 8192 rows");
+            for (int position = 0; position < page.getPositionCount(); position++) {
+                assertEquals(nextExpectedValue++, BigintType.BIGINT.getLong(page.getBlock(0), position));
+            }
+            totalRows += page.getPositionCount();
+        }
+        assertEquals(PAGE_ROWS + 17, totalRows);
     }
 
     @Test
-    void emptyFileReadsAsNoPages(@TempDir Path cacheDirectory) throws IOException
-    {
-        ParquetSliceWriter.write(cacheDirectory.resolve("empty.parquet"), List.of(), NAMES,
-                TYPES.stream().map(Type::getBaseName).toList(), TYPE_MANAGER);
+    void emptyParquetFileReturnsNoPages(@TempDir Path directory) throws IOException {
+        Path file = directory.resolve("empty.parquet");
+        try (ParquetSliceWriter.StreamingWriter writer = ParquetSliceWriter.open(
+                file, List.of("n"), List.of("bigint"), TYPE_MANAGER)) {
+            writer.complete();
+        }
 
-        assertTrue(Files.size(cacheDirectory.resolve("empty.parquet")) > 0);
-        assertEquals(List.of(), ParquetSliceReader.read(cacheDirectory.resolve("empty.parquet"), TYPE_MANAGER));
+        assertTrue(drain(ParquetSliceReader.open(file, List.of(0), List.of("bigint"), TYPE_MANAGER)).isEmpty());
+    }
+
+    @Test
+    void invalidChannelIndexIsRejectedAndFileCanBeClosed(@TempDir Path directory) throws IOException {
+        Path file = directory.resolve("one-column.parquet");
+        try (ParquetSliceWriter.StreamingWriter writer = ParquetSliceWriter.open(
+                file, List.of("n"), List.of("bigint"), TYPE_MANAGER)) {
+            writer.write(bigintPage(1));
+            writer.complete();
+        }
+
+        org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> ParquetSliceReader.open(file, List.of(1), List.of("bigint", "bigint"), TYPE_MANAGER));
+    }
+
+    @Test
+    void matchingSchemaIsReadFromCache(@TempDir Path directory) throws IOException {
+        FileSliceStore store = new FileSliceStore(1024 * 1024, TYPE_MANAGER, directory);
+        CacheKey key = cacheKey("matching-schema");
+        List<String> columnTypes = List.of("bigint", "varchar", "boolean", "double");
+        try (FileSliceStore.WriteSession session = store.beginWrite(
+                key, List.of("n", "text", "enabled", "ratio"), columnTypes)) {
+            session.write(mixedPage());
+            session.complete();
+        }
+
+        var cachedPages = store.openRead(key, List.of(0, 1, 2, 3), columnTypes);
+
+        assertTrue(cachedPages.isPresent(), "matching Parquet schema should be a cache hit");
+        List<Page> pages = drain(cachedPages.orElseThrow());
+        assertEquals(1, pages.size());
+        assertEquals(42, BigintType.BIGINT.getLong(pages.get(0).getBlock(0), 0));
+        assertEquals("cached", VarcharType.VARCHAR.getSlice(pages.get(0).getBlock(1), 0).toStringUtf8());
+        assertTrue(BooleanType.BOOLEAN.getBoolean(pages.get(0).getBlock(2), 0));
+        assertEquals(3.5, DoubleType.DOUBLE.getDouble(pages.get(0).getBlock(3), 0));
+    }
+
+    @Test
+    void mismatchedSchemaInvalidatesFileAndReturnsCacheMiss(@TempDir Path directory) throws IOException {
+        FileSliceStore store = new FileSliceStore(1024 * 1024, TYPE_MANAGER, directory);
+        CacheKey key = cacheKey("mismatched-schema");
+        List<String> storedTypes = List.of("bigint", "varchar", "boolean", "double");
+        try (FileSliceStore.WriteSession session = store.beginWrite(
+                key, List.of("n", "text", "enabled", "ratio"), storedTypes)) {
+            session.write(mixedPage());
+            session.complete();
+        }
+        Path cachedFile = store.fileFor(key);
+        assertTrue(Files.exists(cachedFile), "test setup should publish the Parquet slice");
+
+        // The first two and last types match; the stored BOOLEAN field is incorrectly claimed as DOUBLE.
+        var cachedPages = store.openRead(key, List.of(0, 1, 2, 3), List.of("bigint", "varchar", "double", "double"));
+
+        assertTrue(cachedPages.isEmpty(), "schema mismatch should be treated as a cache miss");
+        assertFalse(Files.exists(cachedFile), "schema-mismatched Parquet file should be invalidated");
     }
 }
