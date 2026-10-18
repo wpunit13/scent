@@ -1,5 +1,7 @@
 package com.scent.trino.cache;
 
+import com.scent.trino.constants.WriteResult;
+import com.scent.trino.exceptions.ParquetSchemaMismatchException;
 import io.trino.spi.Page;
 import io.trino.spi.connector.ConnectorPageSource;
 import io.trino.spi.type.TypeManager;
@@ -44,6 +46,17 @@ public final class FileSliceStore {
             log.debug("[SCENT] loaded slice {} from Parquet on disk", key);
             return Optional.of(pageSource);
         }
+        catch (ParquetSchemaMismatchException e) {
+            try {
+                invalidate(key);
+            }
+            catch (IOException invalidationFailure) {
+                e.addSuppressed(invalidationFailure);
+                log.warn("[SCENT] failed to invalidate schema-mismatched slice {}", key, e);
+            }
+            log.warn("[SCENT] schema mismatch for slice {}; treating it as a cache miss", key, e);
+            return Optional.empty();
+        }
         catch (Exception e) {
             log.warn("[SCENT] failed to read Parquet slice {}; treating as miss", key, e);
             return Optional.empty();
@@ -70,6 +83,10 @@ public final class FileSliceStore {
                 .resolve(key.getVersion() + ".parquet");
     }
 
+    void invalidate(CacheKey key) throws IOException {
+        Files.deleteIfExists(fileFor(key));
+    }
+
     public boolean isEnabled() {
         return storageDirectory != null && typeManager != null;
     }
@@ -86,19 +103,19 @@ public final class FileSliceStore {
             this.maxBytes = maxBytes;
         }
 
-        boolean write(Page page) throws IOException {
+        WriteResult write(Page page) throws IOException {
             if (finished || aborted) {
-                return false;
+                return WriteResult.CLOSED;
             }
             long pageBytes = page.getSizeInBytes();
             if (pageBytes > maxBytes - bytes) {
                 abort();
-                return false;
+                return WriteResult.CAP_EXCEEDED;
             }
             try {
                 writer.write(page);
                 bytes += pageBytes;
-                return true;
+                return WriteResult.WRITTEN;
             }
             catch (IOException | RuntimeException e) {
                 abort();

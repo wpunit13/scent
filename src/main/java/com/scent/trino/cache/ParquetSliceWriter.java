@@ -1,5 +1,6 @@
 package com.scent.trino.cache;
 
+import com.scent.trino.BuildInfo;
 import io.trino.parquet.writer.ParquetSchemaConverter;
 import io.trino.parquet.writer.ParquetWriter;
 import io.trino.parquet.writer.ParquetWriterOptions;
@@ -55,7 +56,7 @@ final class ParquetSliceWriter {
                             schema.primitiveTypes(),
                             ParquetWriterOptions.builder().build(),
                             CompressionCodec.GZIP,
-                            "SCENT / Trino " + com.scent.trino.BuildInfo.trinoVersion(),
+                            "SCENT / Trino " + BuildInfo.trinoVersion(),
                             Optional.of(DateTimeZone.UTC),
                             Optional.empty());
             }

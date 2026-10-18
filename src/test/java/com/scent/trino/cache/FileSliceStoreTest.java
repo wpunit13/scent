@@ -1,5 +1,6 @@
 package com.scent.trino.cache;
 
+import com.scent.trino.constants.WriteResult;
 import io.airlift.slice.Slices;
 import io.trino.spi.Page;
 import io.trino.spi.block.BlockBuilder;
@@ -88,9 +89,9 @@ class FileSliceStoreTest {
         Page first = page(42, "hello");
         Page second = page(84, "world");
         try (FileSliceStore.WriteSession session = store.beginWrite(key, List.of("n", "v"), List.of("bigint", "varchar"))) {
-            assertTrue(session.write(first));
+            assertEquals(WriteResult.WRITTEN, session.write(first));
             assertTrue(Files.notExists(store.fileFor(key)), "slice must stay hidden before complete()");
-            assertTrue(session.write(second));
+            assertEquals(WriteResult.WRITTEN, session.write(second));
             session.complete();
         }
 
@@ -130,7 +131,7 @@ class FileSliceStoreTest {
         CacheKey key = key("aborted");
         FileSliceStore store = new FileSliceStore(1024 * 1024, TYPE_MANAGER, directory);
         FileSliceStore.WriteSession session = store.beginWrite(key, List.of("n", "v"), List.of("bigint", "varchar"));
-        assertTrue(session.write(page(1, "partial")));
+        assertEquals(WriteResult.WRITTEN, session.write(page(1, "partial")));
 
         session.abort();
 
@@ -148,10 +149,10 @@ class FileSliceStoreTest {
         FileSliceStore store = new FileSliceStore(40, TYPE_MANAGER, directory);
 
         try (FileSliceStore.WriteSession session = store.beginWrite(tooLarge, List.of("n", "v"), List.of("bigint", "varchar"))) {
-            assertFalse(session.write(page(1, "this value pushes the page over the limit")));
+            assertEquals(WriteResult.CAP_EXCEEDED, session.write(page(1, "this value pushes the page over the limit")));
         }
         try (FileSliceStore.WriteSession session = store.beginWrite(withinLimit, List.of("n", "v"), List.of("bigint", "varchar"))) {
-            assertTrue(session.write(page(2, "x")));
+            assertEquals(WriteResult.WRITTEN, session.write(page(2, "x")));
             session.complete();
         }
 

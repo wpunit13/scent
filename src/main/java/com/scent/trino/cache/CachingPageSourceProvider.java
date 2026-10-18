@@ -1,5 +1,6 @@
 package com.scent.trino.cache;
 
+import com.scent.trino.constants.WriteResult;
 import io.trino.spi.Page;
 import io.trino.spi.block.Block;
 import io.trino.spi.connector.ColumnHandle;
@@ -131,7 +132,7 @@ public class CachingPageSourceProvider implements ConnectorPageSourceProvider {
         private final FileSliceStore sliceStore;
         private FileSliceStore.WriteSession writeSession;
         private boolean cacheable;
-        private boolean published;
+        private boolean completionHandled;
 
         PopulatingPageSource(
                 ConnectorPageSource delegate,
@@ -208,9 +209,11 @@ public class CachingPageSourceProvider implements ConnectorPageSourceProvider {
             // The engine may stop at isFinished() without polling the terminal null,
             // so a completed slice can publish here too; publishIfComplete is idempotent.
             publishIfComplete();
-            if (!published) {
+            if (!completionHandled) {
                 abortWriteSession();
-                log.debug("[SCENT] discarded incomplete slice {}", split.getCacheKey());
+                if (cacheable && writeSession != null) {
+                    log.debug("[SCENT] discarded incomplete slice {}", split.getCacheKey());
+                }
             }
             delegate.close();
         }
@@ -220,8 +223,8 @@ public class CachingPageSourceProvider implements ConnectorPageSourceProvider {
          * is complete exactly when this succeeds.
          */
         private void publishIfComplete() {
-            if (!published && delegate.isFinished()) {
-                published = true;
+            if (!completionHandled && delegate.isFinished()) {
+                completionHandled = true;
                 if (cacheable) {
                     try {
                         if (writeSession != null) {
@@ -242,10 +245,18 @@ public class CachingPageSourceProvider implements ConnectorPageSourceProvider {
                 return;
             }
             try {
-                if (writeSession != null && !writeSession.write(page)) {
-                    cacheable = false;
-                    writeSession = null;
-                    log.debug("[SCENT] skipped oversized slice {} (limit {} bytes)", split.getCacheKey(), sliceStore.maxBytes());
+                if (writeSession != null) {
+                    WriteResult result = writeSession.write(page);
+                    if (result == WriteResult.CAP_EXCEEDED) {
+                        cacheable = false;
+                        writeSession = null;
+                        log.debug("[SCENT] skipped oversized slice {} (limit {} bytes)", split.getCacheKey(), sliceStore.maxBytes());
+                    }
+                    else if (result == WriteResult.CLOSED) {
+                        cacheable = false;
+                        writeSession = null;
+                        log.warn("[SCENT] slice write session was already closed for {}", split.getCacheKey());
+                    }
                 }
             }
             catch (Exception e) {
