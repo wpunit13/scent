@@ -1,6 +1,6 @@
 # SCENT implementation todo
 
-Queue order: T16 (critical, next) → T15 (disk-only store, ADR-014) → Phase 4 (S7) → Phase 5 → Phase 6.
+Queue order: T17 (durable planning notes, next) → Phase 5 (freshness, reshaped to cache-first) → Phase 6.
 
 ## Phase 1 — Baseline & measurement
 - [x] T1: Success criteria + benchmark harness
@@ -26,11 +26,25 @@ Queue order: T16 (critical, next) → T15 (disk-only store, ADR-014) → Phase 4
 - [x] Cache survives worker restart; parquet actually read
 
 ## Phase 4 — Source-outage resilience (S7)
-- [ ] T8: Connector-level metadata cache (outage-safe planning)
+- [x] T8: Connector-level metadata cache (outage-safe planning)
+
+## Phase 4.5 — Durable planning notes (S7 follow-on)
+- [ ] T17: Lazy file sidecars for planning metadata — table note (handle, columns, schema,
+      timestamp) and slice note (filtered handle, last split batch) written next to the data
+      they describe, on change only; read on in-memory miss at the existing fallback points.
+      No boot-time preload (zero startup cost); no store interface (files are the only tier);
+      note trust follows Phase 5 freshness; unreadable note degrades to in-memory fallback.
 
 ## Phase 5 — Freshness (ADR-007)
 - [ ] T9: `version:none` + refresh TTL
 - [ ] T10: `version:max_updated_at` + `immutable`/`versioned` modes
+
+> Design update (2026-10-18): TTL governs planning metadata as well as data slices. Cache
+> becomes the first path tried for planning: fresh entries plan with zero source contact,
+> expired entries refresh from the source, and a failed refresh serves stale within a grace
+> window. That grace window replaces the outage fallback as a special case; T8's per-call
+> fallbacks remain as the net under it. Requires T17 (notes) so the cache-first default
+> survives a restart.
 
 ## Phase 6 — Local-mode production hardening
 - [ ] T11: Bucket subdivision of coarse JDBC splits (ADR-012)

@@ -156,6 +156,33 @@ check "restart: no source read" 1 "$no_new"
 disk_loads=$(docker compose logs trino-worker 2>/dev/null | grep -c 'loaded slice.*from Parquet' || true); [ "$disk_loads" -ge 1 ] && disk_loads=1 || disk_loads=0
 check "restart: slice loaded from disk" 1 "$disk_loads"
 
+echo "== source outage (S7: planning survives a stopped source)"
+docker compose stop postgres > /dev/null 2>&1
+check "outage: cached sum served without source" 7425.0 "$(scalar "SELECT sum(value) FROM scent.public.metrics WHERE region='us-east'")"
+outage_misses=$(docker compose logs trino-worker 2>/dev/null | grep -c 'cache miss' || true)
+[ "$outage_misses" = "$after_misses" ] && outage_no_new=1 || outage_no_new=0
+check "outage: no new cache miss" 1 "$outage_no_new"
+docker compose start postgres > /dev/null 2>&1
+for _ in $(seq 1 30); do
+  docker compose exec -T postgres psql -U test -d test -c 'SELECT 1' > /dev/null 2>&1 && break
+  sleep 2
+done
+# The pooled JDBC connection dies with the stopped source; the first queries after the
+# restart still fall back to cache while the pool replaces it. Success means an attempt
+# that adds no new outage fallback lines compared to the previous attempt, which is the
+# proof the live source answered.
+prev_serves=$(docker compose logs trino-coordinator 2>/dev/null | grep -c 'source outage' || true)
+refresh_ok=0
+for _ in $(seq 1 20); do
+  scalar "SELECT sum(value) FROM scent.public.metrics WHERE region='us-east'" > /dev/null || true
+  now_serves=$(docker compose logs trino-coordinator 2>/dev/null | grep -c 'source outage' || true)
+  if [ "$now_serves" = "$prev_serves" ]; then refresh_ok=1; break; fi
+  prev_serves="$now_serves"
+  sleep 3
+done
+check "postgres back: metadata refreshes from source" 1 "$refresh_ok"
+check "postgres back: cached sum still correct" 7425.0 "$(scalar "SELECT sum(value) FROM scent.public.metrics WHERE region='us-east'")"
+
 echo "== Parquet files in the shared cache mount"
 find ./cache -type f -name '*.parquet' -exec ls -lh {} \;
 while IFS= read -r worker_id; do

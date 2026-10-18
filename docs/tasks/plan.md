@@ -128,14 +128,37 @@ Lock scope and get a measurable yardstick before building more.
 - Verification: e2e adds a `docker compose stop postgres` step followed by a hit assertion.
 - Dependencies: none (parallelizable with Phase 2–3).
 
+### Phase 4.5 — Durable planning notes (S7 follow-on)
+
+**Task 17: Lazy file sidecars for planning metadata.**
+- Description: the T8 metadata cache and split memory are in-JVM only and vanish on restart, so a
+  restart during a source outage fails even fully cached queries until the source returns. Persist a
+  small JSON note per table (delegate handle, columns, schema, refresh timestamp) inside the table's
+  cache directory, and a note per slice (filtered handle for that partition domain, last split batch)
+  next to the slice's Parquet file. Written on change, not per query; read lazily on in-memory miss at
+  the existing fallback points (never at boot, so startup cost is unchanged). The coordinator already
+  mounts the cache directory, so no infra change is required. No store interface: files are the only
+  tier (decided 2026-10-18; a remote store such as Redis adds a failure domain and latency without a
+  benefit in single-coordinator local mode). A failed note write is logged and swallowed. Trust in a
+  note follows Phase 5 freshness once it exists.
+- Acceptance: with postgres stopped and the coordinator restarted since the last successful query, a
+  fully cached slice query still returns correct results (served from notes plus disk).
+- Verification: unit tests for note round-trip incl. delegate handle JSON serialization (spike first);
+  e2e outage step extended with a coordinator restart between populate and the outage query.
+- Dependencies: Task 8 (done). Must land before Phase 5 flips the default to cache-first.
+
 ### Phase 5 — Freshness (ADR-007)
 
 **Task 9: `version:none` + refresh TTL (bounded staleness MVP).**
 - Description: implement the honest "cache within `refresh`, accept staleness" mode first — a per-slice
   TTL that expires the key. Lowest-risk entry to freshness.
+- Design update (2026-10-18): the same TTL governs planning metadata (T8 cache + T17 notes). The
+  connector flips to cache-first: fresh entries plan with zero source contact; expired entries refresh
+  from the source; a failed refresh serves stale within a grace window, which subsumes the outage
+  fallback as a general mechanism. Criterion 3 restated: cache-first with a bounded clock, not a freeze.
 - Acceptance: a slice expires after `refresh` and is re-populated on next query.
 - Verification: unit test for TTL expiry; e2e with a tiny `refresh`.
-- Dependencies: Task 4.
+- Dependencies: Task 4, Task 17.
 
 **Task 10: `version:max_updated_at` + `immutable`/`versioned` modes.**
 - Description: per-slice `SELECT max(updated_at) …` version acquisition, `check: sync|refresh`, and the
@@ -260,3 +283,10 @@ Lock scope and get a measurable yardstick before building more.
 6. **Per-table partition columns (2026-10-11)** — confirmed: catalog-wide
    `cache.partition-column` is an invalid assumption; the partition column is a per-table property. Critical,
    next after Phase 3. Supersedes the README's Out-of-Scope "configurable caching policies" entry.
+7. **Outage posture and planning-notes persistence (2026-10-18)** — T8's fallback fires only on source
+   failure (cache as fallback, not freeze). A remote metadata store (Redis/DB) is rejected for local mode:
+   one coordinator is the single client, local files beat the network on latency, and a second live service
+   inside the outage-resilience path compounds failure domains. Persistence is lazy file sidecars instead
+   (Task 17, zero boot cost). Phase 5's TTL becomes the mechanism that flips planning to cache-first;
+   the outage fallback becomes the grace window under it. `OutageSafeSplitManager` stays: it never fires
+   for postgres (split generation is pure) but covers delegates whose split discovery queries the source.

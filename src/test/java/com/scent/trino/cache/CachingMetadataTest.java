@@ -1,9 +1,11 @@
 package com.scent.trino.cache;
 
 import io.trino.spi.connector.ColumnHandle;
+import io.trino.spi.connector.ColumnSchema;
 import io.trino.spi.connector.ConnectorMetadata;
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorTableHandle;
+import io.trino.spi.connector.ConnectorTableSchema;
 import io.trino.spi.connector.ConnectorTableVersion;
 import io.trino.spi.connector.Constraint;
 import io.trino.spi.connector.ConstraintApplicationResult;
@@ -12,6 +14,7 @@ import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.expression.Constant;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
+import io.trino.spi.statistics.TableStatistics;
 import io.trino.spi.type.BigintType;
 import io.trino.spi.type.VarcharType;
 import org.junit.jupiter.api.Test;
@@ -26,6 +29,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CachingMetadataTest {
@@ -47,6 +51,22 @@ class CachingMetadataTest {
         ConnectorTableHandle columnHandlesHandle;
         ConnectorTableHandle applyFilterHandle;
         Constraint applyFilterConstraint;
+        RuntimeException tableHandleFailure;
+        RuntimeException columnHandlesFailure;
+        RuntimeException schemaFailure;
+        RuntimeException applyFilterFailure;
+        int columnHandlesCalls;
+        int statisticsCalls;
+
+        @Override
+        public ConnectorTableSchema getTableSchema(ConnectorSession session, ConnectorTableHandle tableHandle) {
+            if (schemaFailure != null) {
+                throw schemaFailure;
+            }
+            return new ConnectorTableSchema(
+                    new SchemaTableName("schema", "table"),
+                    List.of(ColumnSchema.builder().setName(PARTITION_COLUMN).setType(BigintType.BIGINT).build()));
+        }
 
         @Override
         public ConnectorTableHandle getTableHandle(
@@ -54,11 +74,18 @@ class CachingMetadataTest {
                 SchemaTableName tableName,
                 Optional<ConnectorTableVersion> startVersion,
                 Optional<ConnectorTableVersion> endVersion) {
+            if (tableHandleFailure != null) {
+                throw tableHandleFailure;
+            }
             return handle;
         }
 
         @Override
         public Map<String, ColumnHandle> getColumnHandles(ConnectorSession session, ConnectorTableHandle tableHandle) {
+            if (columnHandlesFailure != null) {
+                throw columnHandlesFailure;
+            }
+            columnHandlesCalls++;
             columnHandlesHandle = tableHandle;
             return columns;
         }
@@ -77,10 +104,19 @@ class CachingMetadataTest {
         }
 
         @Override
+        public TableStatistics getTableStatistics(ConnectorSession session, ConnectorTableHandle tableHandle) {
+            statisticsCalls++;
+            return TableStatistics.empty();
+        }
+
+        @Override
         public Optional<ConstraintApplicationResult<ConnectorTableHandle>> applyFilter(
                 ConnectorSession session,
                 ConnectorTableHandle tableHandle,
                 Constraint constraint) {
+            if (applyFilterFailure != null) {
+                throw applyFilterFailure;
+            }
             applyFilterHandle = tableHandle;
             applyFilterConstraint = constraint;
             if (pushEverything) {
@@ -95,15 +131,16 @@ class CachingMetadataTest {
     private final ColumnHandle partitionHandle = new ColumnHandle() {};
     private final ColumnHandle partitionHandle2 = new ColumnHandle() {};
     private final ColumnHandle otherHandle = new ColumnHandle() {};
+    private final TableMetadataCache metadataCache = new TableMetadataCache();
 
     private ConnectorMetadata metadata() {
         stub.columns = Map.of(PARTITION_COLUMN, partitionHandle, "other", otherHandle);
-        return CachingMetadata.wrap(stub, Map.of(TABLE_ID, List.of(PARTITION_COLUMN)), false);
+        return CachingMetadata.wrap(stub, Map.of(TABLE_ID, List.of(PARTITION_COLUMN)), false, metadataCache);
     }
 
     private ConnectorMetadata metadataWithColumnTypes() {
         stub.columns = Map.of(PARTITION_COLUMN, partitionHandle, "other", otherHandle);
-        return CachingMetadata.wrap(stub, Map.of(TABLE_ID, List.of(PARTITION_COLUMN)), true);
+        return CachingMetadata.wrap(stub, Map.of(TABLE_ID, List.of(PARTITION_COLUMN)), true, metadataCache);
     }
 
     private ConnectorMetadata multiColumnMetadata() {
@@ -111,12 +148,12 @@ class CachingMetadataTest {
                 PARTITION_COLUMN, partitionHandle,
                 PARTITION_COLUMN_2, partitionHandle2,
                 "other", otherHandle);
-        return CachingMetadata.wrap(stub, Map.of(TABLE_ID, List.of(PARTITION_COLUMN, PARTITION_COLUMN_2)), false);
+        return CachingMetadata.wrap(stub, Map.of(TABLE_ID, List.of(PARTITION_COLUMN, PARTITION_COLUMN_2)), false, metadataCache);
     }
 
     private ConnectorMetadata unconfiguredMetadata() {
         stub.columns = Map.of(PARTITION_COLUMN, partitionHandle, "other", otherHandle);
-        return CachingMetadata.wrap(stub, Map.of("other.schema.otherTable", List.of(PARTITION_COLUMN)), false);
+        return CachingMetadata.wrap(stub, Map.of("other.schema.otherTable", List.of(PARTITION_COLUMN)), false, metadataCache);
     }
 
     private CachingTableHandle tableHandle(ConnectorMetadata metadata) {
@@ -373,5 +410,148 @@ class CachingMetadataTest {
         CachingTableHandle cached = assertInstanceOf(CachingTableHandle.class, result.get().getHandle());
         assertTrue(cached.getPartitionDomain().isAll());
         assertEquals(delegateRemaining, result.get().getRemainingFilter());
+    }
+
+    @Test
+    void outageServesTableHandleAndColumnsFromCache() {
+        ConnectorMetadata metadata = metadataWithColumnTypes();
+        CachingTableHandle first = tableHandle(metadata);
+        metadata.getColumnHandles(null, first);
+
+        RuntimeException outage = new RuntimeException("source down");
+        stub.tableHandleFailure = outage;
+        stub.columnHandlesFailure = outage;
+
+        ConnectorTableHandle second = metadata.getTableHandle(
+                null, new SchemaTableName("schema", "table"), Optional.empty(), Optional.empty());
+        CachingTableHandle cached = assertInstanceOf(CachingTableHandle.class, second);
+        assertSame(stub.handle, cached.getDelegateHandle());
+        assertEquals(first.getColumnHandles(), cached.getColumnHandles());
+        assertEquals(first.getColumnTypes(), cached.getColumnTypes());
+
+        Map<String, ColumnHandle> columns = metadata.getColumnHandles(null, cached);
+        assertEquals(stub.columns, columns);
+        assertEquals(1, stub.columnHandlesCalls);
+    }
+
+    @Test
+    void outageOnUnknownTableRethrowsSourceError() {
+        ConnectorMetadata metadata = metadata();
+        RuntimeException outage = new RuntimeException("source down");
+        stub.tableHandleFailure = outage;
+
+        RuntimeException thrown = assertThrows(RuntimeException.class, () ->
+                metadata.getTableHandle(null, new SchemaTableName("schema", "table"), Optional.empty(), Optional.empty()));
+        assertSame(outage, thrown);
+    }
+
+    @Test
+    void outageServesTableSchemaFromCache() {
+        ConnectorMetadata metadata = metadata();
+        CachingTableHandle wrapped = tableHandle(metadata);
+        ConnectorTableSchema before = (ConnectorTableSchema) metadata.getTableSchema(null, wrapped);
+
+        RuntimeException outage = new RuntimeException("source down");
+        stub.schemaFailure = outage;
+
+        ConnectorTableSchema after = (ConnectorTableSchema) metadata.getTableSchema(null, wrapped);
+        assertEquals(before.getTable(), after.getTable());
+        assertEquals(before.getColumns(), after.getColumns());
+    }
+
+    @Test
+    void outageTableSchemaWithoutCachedSchemaRethrowsSourceError() {
+        ConnectorMetadata metadata = metadata();
+        CachingTableHandle wrapped = tableHandle(metadata);
+
+        RuntimeException outage = new RuntimeException("source down");
+        stub.schemaFailure = outage;
+
+        RuntimeException thrown = assertThrows(RuntimeException.class, () ->
+                metadata.getTableSchema(null, wrapped));
+        assertSame(outage, thrown);
+    }
+
+    @Test
+    void applyFilterOutageServesRememberedFilteredHandle() {
+        ConnectorMetadata metadata = metadata();
+        stub.filteredHandle = new ConnectorTableHandle() {};
+        stub.filterResult = Optional.of(new ConstraintApplicationResult<>(
+                stub.filteredHandle, TupleDomain.all(), Constant.TRUE, false));
+        CachingTableHandle wrapped = tableHandle(metadata);
+        metadata.getColumnHandles(null, wrapped);
+        Constraint constraint = new Constraint(withColumnDomains(Map.of(partitionHandle, PART)));
+        assertTrue(metadata.applyFilter(null, wrapped, constraint).isPresent());
+
+        stub.applyFilterFailure = new RuntimeException("source down");
+
+        Optional<ConstraintApplicationResult<ConnectorTableHandle>> result =
+                metadata.applyFilter(null, wrapped, constraint);
+        assertTrue(result.isPresent());
+        CachingTableHandle cached = assertInstanceOf(CachingTableHandle.class, result.get().getHandle());
+        assertSame(stub.filteredHandle, cached.getDelegateHandle());
+        assertEquals(withColumnDomains(Map.of(partitionHandle, PART)), cached.getPartitionDomain());
+        assertEquals(wrapped.getColumnHandles(), cached.getColumnHandles());
+        assertTrue(result.get().getRemainingFilter().isAll());
+    }
+
+    @Test
+    void applyFilterOutageWithoutRememberedHandleDeclinesPushdown() {
+        ConnectorMetadata metadata = metadata();
+        stub.filteredHandle = new ConnectorTableHandle() {};
+        CachingTableHandle wrapped = tableHandle(metadata);
+        metadata.getColumnHandles(null, wrapped);
+
+        stub.applyFilterFailure = new RuntimeException("source down");
+
+        Optional<ConstraintApplicationResult<ConnectorTableHandle>> result = metadata.applyFilter(
+                null, wrapped, new Constraint(withColumnDomains(Map.of(partitionHandle, PART))));
+        assertTrue(result.isEmpty());
+    }
+
+    @Test
+    void outageColumnHandlesWithoutCachedColumnsRethrowsSourceError() {
+        ConnectorMetadata metadata = metadata();
+        CachingTableHandle wrapped = tableHandle(metadata);
+
+        RuntimeException outage = new RuntimeException("source down");
+        stub.columnHandlesFailure = outage;
+
+        RuntimeException thrown = assertThrows(RuntimeException.class, () ->
+                metadata.getColumnHandles(null, wrapped));
+        assertSame(outage, thrown);
+    }
+
+    @Test
+    void applyFilterResolvesPartitionColumnsFromCache() {
+        ConnectorMetadata metadata = metadata();
+        stub.filteredHandle = new ConnectorTableHandle() {};
+        stub.filterResult = Optional.of(new ConstraintApplicationResult<>(
+                stub.filteredHandle, TupleDomain.all(), Constant.TRUE, false));
+        CachingTableHandle wrapped = tableHandle(metadata);
+        metadata.getColumnHandles(null, wrapped);
+        int callsAfterFirstPass = stub.columnHandlesCalls;
+
+        metadata.applyFilter(null, wrapped, new Constraint(withColumnDomains(Map.of(partitionHandle, PART))));
+
+        assertEquals(callsAfterFirstPass, stub.columnHandlesCalls);
+    }
+
+    @Test
+    void getTableStatisticsSkipsSourceForKnownTables() {
+        ConnectorMetadata metadata = metadata();
+        CachingTableHandle wrapped = tableHandle(metadata);
+
+        assertEquals(TableStatistics.empty(), metadata.getTableStatistics(null, wrapped));
+        assertEquals(0, stub.statisticsCalls);
+    }
+
+    @Test
+    void getTableStatisticsForwardsForUnknownTables() {
+        ConnectorMetadata metadata = metadata();
+        ConnectorTableHandle foreign = new ConnectorTableHandle() {};
+
+        assertEquals(TableStatistics.empty(), metadata.getTableStatistics(null, foreign));
+        assertEquals(1, stub.statisticsCalls);
     }
 }
