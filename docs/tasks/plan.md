@@ -149,9 +149,15 @@ Lock scope and get a measurable yardstick before building more.
 **Task 11: Bucket subdivision of coarse JDBC splits (ADR-012).**
 - Description: query `min/max` of a range column per slice; emit N range-domain splits when the row estimate
   justifies it. Cache unit becomes `(slice, bucket)`.
+- Fallback variant (decided 2026-10-11): for tables with no source-prunable column, subdivide by stream
+  position instead. Roll the write session at the per-slice cap into numbered chunks
+  (root/table/partition/version-N.parquet), cached incrementally, read back concatenated. Chunks are not
+  addressable and give no parallelism, so range buckets remain the primary mechanism; chunking covers the
+  tables range buckets cannot serve. Either way, bound the chunk or bucket count per slice so disk stays
+  finite.
 - Acceptance: a large JDBC partition splits into N workers; a small one does not.
 - Verification: e2e shows >1 split for a big partition; unit tests for boundary math.
-- Dependencies: Task 4 (key carries bucket).
+- Dependencies: Task 4 (key carries bucket), Task 15 (streaming session provides the roll point).
 
 **Task 12: Affinity via `getAffinityKey` (ADR-005, local mode).**
 - Description: emit `(slice, bucket)` affinity key so the engine routes a bucket to the same worker.
