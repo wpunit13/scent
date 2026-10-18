@@ -35,27 +35,31 @@ public final class CachingMetadata implements InvocationHandler {
     private final Map<String, List<String>> partitionColumnsByTable;
     private final boolean captureColumnTypes;
     private final TableMetadataCache metadataCache;
+    private final PlanningNotes planningNotes;
 
     public CachingMetadata(
             ConnectorMetadata delegate,
             Map<String, List<String>> partitionColumnsByTable,
             boolean captureColumnTypes,
-            TableMetadataCache metadataCache) {
+            TableMetadataCache metadataCache,
+            PlanningNotes planningNotes) {
         this.delegate = Objects.requireNonNull(delegate, "delegate is null");
         this.partitionColumnsByTable = Objects.requireNonNull(partitionColumnsByTable, "partitionColumnsByTable is null");
         this.captureColumnTypes = captureColumnTypes;
         this.metadataCache = Objects.requireNonNull(metadataCache, "metadataCache is null");
+        this.planningNotes = Objects.requireNonNull(planningNotes, "planningNotes is null");
     }
 
     public static ConnectorMetadata wrap(
             ConnectorMetadata delegate,
             Map<String, List<String>> partitionColumnsByTable,
             boolean captureColumnTypes,
-            TableMetadataCache metadataCache) {
+            TableMetadataCache metadataCache,
+            PlanningNotes planningNotes) {
         return (ConnectorMetadata) Proxy.newProxyInstance(
                 ConnectorMetadata.class.getClassLoader(),
                 new Class<?>[] {ConnectorMetadata.class},
-                new CachingMetadata(delegate, partitionColumnsByTable, captureColumnTypes, metadataCache));
+                new CachingMetadata(delegate, partitionColumnsByTable, captureColumnTypes, metadataCache, planningNotes));
     }
 
     /**
@@ -112,7 +116,9 @@ public final class CachingMetadata implements InvocationHandler {
         if (result == null) {
             return null;
         }
-        metadataCache.put(tableName, (ConnectorTableHandle) result, null, null);
+        if (metadataCache.put(tableName, (ConnectorTableHandle) result, null, null)) {
+            writeTableNote(tableName);
+        }
         return new CachingTableHandle(
                 (ConnectorTableHandle) result,
                 tableName,
@@ -123,13 +129,28 @@ public final class CachingMetadata implements InvocationHandler {
 
     /**
      * S7: a table seen at least once plans without the source. The cached handle is served
-     * fresh-wrapped on source failure only; on a cache miss the source error propagates, so a
-     * table never seen before still fails like it does today.
+     * fresh-wrapped on source failure only; on a miss in memory and on disk the source error
+     * propagates, so a table never seen before still fails like it does today.
      */
     private Object cachedTableHandle(SchemaTableName tableName, Throwable sourceFailure) throws Throwable {
         Optional<ConnectorTableHandle> cached = metadataCache.getHandle(tableName);
         if (cached.isEmpty()) {
-            throw sourceFailure;
+            Optional<PlanningNotes.TableMetadata> noted = planningNotes.readTable(tableName);
+            if (noted.isEmpty()) {
+                throw sourceFailure;
+            }
+            PlanningNotes.TableMetadata note = noted.get();
+            metadataCache.put(tableName, note.handle(), note.columns(), note.columnTypes());
+            if (note.schema() != null) {
+                metadataCache.putSchema(tableName, note.schema());
+            }
+            log.info("[SCENT SPI] source outage: serving table handle for {} from metadata note", tableName);
+            return new CachingTableHandle(
+                    note.handle(),
+                    tableName,
+                    TupleDomain.all(),
+                    note.columns(),
+                    note.columnTypes());
         }
         log.info("[SCENT SPI] source outage: serving table handle for {} from metadata cache", tableName);
         return new CachingTableHandle(
@@ -167,7 +188,9 @@ public final class CachingMetadata implements InvocationHandler {
             else {
                 types = null;
             }
-            metadataCache.put(caching.getSchemaTableName(), caching.getDelegateHandle(), result, types);
+            if (metadataCache.put(caching.getSchemaTableName(), caching.getDelegateHandle(), result, types)) {
+                writeTableNote(caching.getSchemaTableName());
+            }
         }
         return result;
     }
@@ -178,7 +201,15 @@ public final class CachingMetadata implements InvocationHandler {
         }
         Optional<Map<String, ColumnHandle>> cached = metadataCache.getColumns(caching.getSchemaTableName());
         if (cached.isEmpty()) {
-            throw sourceFailure;
+            Optional<PlanningNotes.TableMetadata> noted = planningNotes.readTable(caching.getSchemaTableName());
+            if (noted.isEmpty() || noted.get().columns() == null) {
+                throw sourceFailure;
+            }
+            PlanningNotes.TableMetadata note = noted.get();
+            metadataCache.put(caching.getSchemaTableName(), note.handle(), note.columns(), note.columnTypes());
+            log.info("[SCENT SPI] source outage: serving column handles for {} from metadata note", caching.getSchemaTableName());
+            caching.attachColumns(note.columns());
+            return note.columns();
         }
         log.info("[SCENT SPI] source outage: serving column handles for {} from metadata cache", caching.getSchemaTableName());
         caching.attachColumns(cached.get());
@@ -195,7 +226,9 @@ public final class CachingMetadata implements InvocationHandler {
             return cachedTableSchema(caching, unwrapCause(exception));
         }
         if (caching != null && result != null) {
-            metadataCache.putSchema(caching.getSchemaTableName(), result);
+            if (metadataCache.putSchema(caching.getSchemaTableName(), result)) {
+                writeTableNote(caching.getSchemaTableName());
+            }
         }
         return result;
     }
@@ -206,7 +239,13 @@ public final class CachingMetadata implements InvocationHandler {
         }
         Optional<ConnectorTableSchema> cached = metadataCache.getSchema(caching.getSchemaTableName());
         if (cached.isEmpty()) {
-            throw sourceFailure;
+            Optional<PlanningNotes.TableMetadata> noted = planningNotes.readTable(caching.getSchemaTableName());
+            if (noted.isEmpty() || noted.get().schema() == null) {
+                throw sourceFailure;
+            }
+            metadataCache.putSchema(caching.getSchemaTableName(), noted.get().schema());
+            log.info("[SCENT SPI] source outage: serving table schema for {} from metadata note", caching.getSchemaTableName());
+            return noted.get().schema();
         }
         log.info("[SCENT SPI] source outage: serving table schema for {} from metadata cache", caching.getSchemaTableName());
         return cached.get();
@@ -227,6 +266,19 @@ public final class CachingMetadata implements InvocationHandler {
 
     private static Throwable unwrapCause(InvocationTargetException exception) {
         return exception.getCause() != null ? exception.getCause() : exception;
+    }
+
+    /** Persists the table's current planning entry; nulls inside keep the previously noted fields. */
+    private void writeTableNote(SchemaTableName tableName) {
+        Optional<ConnectorTableHandle> handle = metadataCache.getHandle(tableName);
+        if (handle.isEmpty()) {
+            return;
+        }
+        planningNotes.writeTableNote(tableName, new PlanningNotes.TableNote(
+                handle.get(),
+                metadataCache.getColumns(tableName).orElse(null),
+                metadataCache.getColumnTypes(tableName).orElse(null),
+                metadataCache.getSchema(tableName).map(PlanningNotes::schemaColumns).orElse(null)));
     }
 
     @SuppressWarnings("unchecked")
@@ -281,7 +333,9 @@ public final class CachingMetadata implements InvocationHandler {
             // applied the partition predicate fully; upgrade to remaining-union if that ever bites.
             return Optional.empty();
         }
-        metadataCache.putFilteredHandle(caching.getSchemaTableName(), merged, result.get().getHandle());
+        if (metadataCache.putFilteredHandle(caching.getSchemaTableName(), merged, result.get().getHandle())) {
+            planningNotes.writeSliceNote(CacheKey.of(caching.getSchemaTableName(), merged), result.get().getHandle());
+        }
         CachingTableHandle wrapped = new CachingTableHandle(
                 result.get().getHandle(),
                 caching.getSchemaTableName(),
@@ -309,10 +363,23 @@ public final class CachingMetadata implements InvocationHandler {
             TupleDomain<ColumnHandle> summary,
             List<ColumnHandle> partitionHandles) {
         Optional<ConnectorTableHandle> remembered = metadataCache.getFilteredHandle(caching.getSchemaTableName(), merged);
+        boolean fromNote = false;
         if (remembered.isEmpty()) {
-            return Optional.empty();
+            CacheKey sliceKey = CacheKey.of(caching.getSchemaTableName(), merged);
+            Optional<PlanningNotes.SliceNote> noted = planningNotes.readSliceNote(sliceKey);
+            if (noted.isEmpty() || noted.get().filteredHandle() == null) {
+                return Optional.empty();
+            }
+            metadataCache.putFilteredHandle(caching.getSchemaTableName(), merged, noted.get().filteredHandle());
+            remembered = Optional.of(noted.get().filteredHandle());
+            fromNote = true;
         }
-        log.info("[SCENT SPI] source outage: serving filtered handle for {} {} from metadata cache", caching.getSchemaTableName(), merged);
+        if (fromNote) {
+            log.info("[SCENT SPI] source outage: serving filtered handle for {} {} from metadata note", caching.getSchemaTableName(), merged);
+        }
+        else {
+            log.info("[SCENT SPI] source outage: serving filtered handle for {} {} from metadata cache", caching.getSchemaTableName(), merged);
+        }
         CachingTableHandle wrapped = new CachingTableHandle(
                 remembered.get(),
                 caching.getSchemaTableName(),

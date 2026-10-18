@@ -79,7 +79,8 @@ public class CachingConnectorFactory implements ConnectorFactory {
                 delegateConnector,
                 partitionColumns,
                 new FileSliceStore(cacheMaxBytes, context.getTypeManager(), storageDirectory),
-                new TableMetadataCache());
+                new TableMetadataCache(),
+                new PlanningNotes(storageDirectory, context.getTypeManager()));
     }
 
     /**

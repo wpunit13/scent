@@ -25,7 +25,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * is down. The delegate's split generation opens a JDBC connection (BaseJdbcClient#toColumnMappings),
  * so on a source failure the last successfully produced batch for the slice is replayed instead.
  * The stale delegate split inside a replayed CachingSplit is reachable only through the populate
- * path, which fails with the source error — stale data is never served.
+ * path, which fails with the source error — stale data is never served. The batch memory is
+ * in-JVM only: split generation after a coordinator restart leans on the delegate's own
+ * getSplits being source-free (true for postgres), so the batch is not noted to disk.
  */
 @Slf4j
 public final class OutageSafeSplitManager implements ConnectorSplitManager {

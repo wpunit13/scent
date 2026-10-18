@@ -29,22 +29,27 @@ Queue order: T17 (durable planning notes, next) → Phase 5 (freshness, reshaped
 - [x] T8: Connector-level metadata cache (outage-safe planning)
 
 ## Phase 4.5 — Durable planning notes (S7 follow-on)
-- [ ] T17: Lazy file sidecars for planning metadata — table note (handle, columns, schema,
-      timestamp) and slice note (filtered handle, last split batch) written next to the data
+- [x] T17: Lazy file sidecars for planning metadata — table note (handle, columns, types,
+      schema shape) and slice note (the delegate's filtered handle) written next to the data
       they describe, on change only; read on in-memory miss at the existing fallback points.
       No boot-time preload (zero startup cost); no store interface (files are the only tier);
       note trust follows Phase 5 freshness; unreadable note degrades to in-memory fallback.
+      Deviation from the original sketch: the slice note does NOT carry the split batch.
+      Delegate split objects embed engine-owned serdes (Block, Type) that a plugin-side
+      mapper cannot round trip, so the batch stays in-JVM; split generation after a restart
+      leans on the delegate's own getSplits being source-free (true for postgres).
 
 ## Phase 5 — Freshness (ADR-007)
 - [ ] T9: `version:none` + refresh TTL
 - [ ] T10: `version:max_updated_at` + `immutable`/`versioned` modes
 
-> Design update (2026-10-18): TTL governs planning metadata as well as data slices. Cache
-> becomes the first path tried for planning: fresh entries plan with zero source contact,
-> expired entries refresh from the source, and a failed refresh serves stale within a grace
-> window. That grace window replaces the outage fallback as a special case; T8's per-call
-> fallbacks remain as the net under it. Requires T17 (notes) so the cache-first default
-> survives a restart.
+> Design update (2026-10-18, revised same day per decision 8): TTL governs planning metadata as
+> well as data slices. Cache becomes the first path tried for planning: fresh entries plan with
+> zero source contact, expired entries refresh from the source, and a failed refresh fails the
+> query — there is no grace window, because the cache is an accelerator, not a delegate
+> replacement. Outage resilience for fresh entries comes free from the TTL bound. The T8 fallback
+> machinery is transitional and is deleted when cache-first lands. Requires T17 (notes) so fresh
+> entries survive a restart.
 
 ## Phase 6 — Local-mode production hardening
 - [ ] T11: Bucket subdivision of coarse JDBC splits (ADR-012)

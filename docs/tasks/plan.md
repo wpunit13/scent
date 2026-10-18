@@ -131,20 +131,30 @@ Lock scope and get a measurable yardstick before building more.
 ### Phase 4.5 — Durable planning notes (S7 follow-on)
 
 **Task 17: Lazy file sidecars for planning metadata.**
-- Description: the T8 metadata cache and split memory are in-JVM only and vanish on restart, so a
-  restart during a source outage fails even fully cached queries until the source returns. Persist a
-  small JSON note per table (delegate handle, columns, schema, refresh timestamp) inside the table's
-  cache directory, and a note per slice (filtered handle for that partition domain, last split batch)
-  next to the slice's Parquet file. Written on change, not per query; read lazily on in-memory miss at
-  the existing fallback points (never at boot, so startup cost is unchanged). The coordinator already
-  mounts the cache directory, so no infra change is required. No store interface: files are the only
-  tier (decided 2026-10-18; a remote store such as Redis adds a failure domain and latency without a
+- Description: the T8 metadata cache is in-JVM only and vanishes on restart, so a restart during a
+  source outage fails even fully cached queries until the source returns. Persist a small JSON note
+  per table (delegate handle, columns, types, schema shape) inside the table's cache directory, and
+  a note per slice (the delegate's filtered handle for that partition domain) beside the slice's
+  Parquet file. Written on change, not per query; read lazily on in-memory miss at the existing
+  fallback points (never at boot, so startup cost is unchanged). The coordinator already mounts the
+  cache directory, so no infra change is required. No store interface: files are the only tier
+  (decided 2026-10-18; a remote store such as Redis adds a failure domain and latency without a
   benefit in single-coordinator local mode). A failed note write is logged and swallowed. Trust in a
   note follows Phase 5 freshness once it exists.
+- Serialization findings (2026-10-18, spike): delegate objects are stored as {type, json} envelopes
+  read back through their own class. A globally polymorphic mapper misreads their delegating
+  creators. The JdbcTableHandle note keeps only the plain relation shape (schema, table,
+  remote names, authorization) rebuilt via reflection, because the full creator graph needs the
+  engine's Block serde; the schema shape is stored as SQL type strings and rebuilt through the
+  TypeManager. Deviation: the slice note does not carry the split batch — delegate split objects
+  need the same engine serdes, so the split batch stays in-JVM (OutageSafeSplitManager replays it
+  within the same coordinator lifetime; after a restart, split generation leans on the delegate's
+  getSplits being source-free, which holds for postgres).
 - Acceptance: with postgres stopped and the coordinator restarted since the last successful query, a
   fully cached slice query still returns correct results (served from notes plus disk).
-- Verification: unit tests for note round-trip incl. delegate handle JSON serialization (spike first);
-  e2e outage step extended with a coordinator restart between populate and the outage query.
+- Verification: unit tests for note round-trip with real JdbcTableHandle/JdbcColumnHandle classes,
+  merge semantics, unreadable/missing/disabled notes, and a full restart simulation; e2e outage step
+  extended with a coordinator restart between populate and the outage query.
 - Dependencies: Task 8 (done). Must land before Phase 5 flips the default to cache-first.
 
 ### Phase 5 — Freshness (ADR-007)
@@ -290,3 +300,10 @@ Lock scope and get a measurable yardstick before building more.
    (Task 17, zero boot cost). Phase 5's TTL becomes the mechanism that flips planning to cache-first;
    the outage fallback becomes the grace window under it. `OutageSafeSplitManager` stays: it never fires
    for postgres (split generation is pure) but covers delegates whose split discovery queries the source.
+8. **Cache is an accelerator, not a delegate replacement (2026-10-18)** — the cache exists to shield
+   the delegate from Trino's query load and to cut redundant round-trips; it is not a standby copy of
+   the delegate, and queries may fail while the delegate is down. Consequences: the T8/T17 outage
+   fallbacks are best-effort behavior on top of this contract, not a promise; the split-batch-after-restart
+   gap is accepted behavior with no follow-up work planned; and Phase 5 cache-first ships WITHOUT a
+   grace window — an expired entry whose refresh fails fails the query, so staleness is bounded by the
+   TTL alone and outage resilience for fresh entries comes free from that bound.

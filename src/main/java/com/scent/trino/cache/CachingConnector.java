@@ -22,27 +22,31 @@ public final class CachingConnector implements InvocationHandler {
     private final Map<String, List<String>> partitionColumnsByTable;
     private final FileSliceStore sliceStore;
     private final TableMetadataCache metadataCache;
+    private final PlanningNotes planningNotes;
 
     public CachingConnector(
             Connector delegate,
             Map<String, List<String>> partitionColumnsByTable,
             FileSliceStore sliceStore,
-            TableMetadataCache metadataCache) {
+            TableMetadataCache metadataCache,
+            PlanningNotes planningNotes) {
         this.delegate = Objects.requireNonNull(delegate, "delegate is null");
         this.partitionColumnsByTable = Objects.requireNonNull(partitionColumnsByTable, "partitionColumnsByTable is null");
         this.sliceStore = Objects.requireNonNull(sliceStore, "sliceStore is null");
         this.metadataCache = Objects.requireNonNull(metadataCache, "metadataCache is null");
+        this.planningNotes = Objects.requireNonNull(planningNotes, "planningNotes is null");
     }
 
     public static Connector wrap(
             Connector delegate,
             Map<String, List<String>> partitionColumnsByTable,
             FileSliceStore sliceStore,
-            TableMetadataCache metadataCache) {
+            TableMetadataCache metadataCache,
+            PlanningNotes planningNotes) {
         return (Connector) Proxy.newProxyInstance(
                 Connector.class.getClassLoader(),
                 new Class<?>[] {Connector.class},
-                new CachingConnector(delegate, partitionColumnsByTable, sliceStore, metadataCache));
+                new CachingConnector(delegate, partitionColumnsByTable, sliceStore, metadataCache, planningNotes));
     }
 
     @Override
@@ -61,7 +65,7 @@ public final class CachingConnector implements InvocationHandler {
 
     private Object wrapResult(Method method, Object result) {
         return switch (method.getName()) {
-            case "getMetadata" -> CachingMetadata.wrap((ConnectorMetadata) result, partitionColumnsByTable, sliceStore.isEnabled(), metadataCache);
+            case "getMetadata" -> CachingMetadata.wrap((ConnectorMetadata) result, partitionColumnsByTable, sliceStore.isEnabled(), metadataCache, planningNotes);
             case "getSplitManager" -> new OutageSafeSplitManager(new CachingSplitManager((ConnectorSplitManager) result));
             case "getPageSourceProvider" -> new CachingPageSourceProvider((ConnectorPageSourceProvider) result, sliceStore);
             case "getPageSourceProviderFactory" -> {ConnectorPageSourceProviderFactory factory = (ConnectorPageSourceProviderFactory) result;

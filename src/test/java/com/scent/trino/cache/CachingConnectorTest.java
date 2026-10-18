@@ -77,7 +77,7 @@ class CachingConnectorTest {
     @Test
     void forwardsShutdownToDelegate() {
         StubConnector stub = new StubConnector();
-        Connector connector = CachingConnector.wrap(stub, Map.of("s.t", List.of("part")), new FileSliceStore(1024 * 1024, null, null), new TableMetadataCache());
+        Connector connector = CachingConnector.wrap(stub, Map.of("s.t", List.of("part")), new FileSliceStore(1024 * 1024, null, null), new TableMetadataCache(), new PlanningNotes(null, null));
 
         connector.shutdown();
 
@@ -87,7 +87,7 @@ class CachingConnectorTest {
     @Test
     void wrapsSpiSubObjectsAndForwardsCalls() {
         StubConnector stub = new StubConnector();
-        Connector connector = CachingConnector.wrap(stub, Map.of("s.t", List.of("part")), new FileSliceStore(1024 * 1024, null, null), new TableMetadataCache());
+        Connector connector = CachingConnector.wrap(stub, Map.of("s.t", List.of("part")), new FileSliceStore(1024 * 1024, null, null), new TableMetadataCache(), new PlanningNotes(null, null));
 
         assertInstanceOf(OutageSafeSplitManager.class, connector.getSplitManager());
         ConnectorPageSourceProviderFactory wrappedFactory = (ConnectorPageSourceProviderFactory) connector.getPageSourceProviderFactory();
@@ -105,7 +105,7 @@ class CachingConnectorTest {
         StubConnector stub = new StubConnector();
         TrinoException boom = new TrinoException(GENERIC_INTERNAL_ERROR, "boom");
         stub.failure = boom;
-        Connector connector = CachingConnector.wrap(stub, Map.of("s.t", List.of("part")), new FileSliceStore(1024 * 1024, null, null), new TableMetadataCache());
+        Connector connector = CachingConnector.wrap(stub, Map.of("s.t", List.of("part")), new FileSliceStore(1024 * 1024, null, null), new TableMetadataCache(), new PlanningNotes(null, null));
 
         assertSame(boom, assertThrows(TrinoException.class, connector::shutdown));
     }
@@ -113,7 +113,7 @@ class CachingConnectorTest {
     @Test
     void metadataCacheIsSharedAcrossTransactions() {
         StubConnector stub = new StubConnector();
-        Connector connector = CachingConnector.wrap(stub, Map.of("s.t", List.of("part")), new FileSliceStore(1024 * 1024, null, null), new TableMetadataCache());
+        Connector connector = CachingConnector.wrap(stub, Map.of("s.t", List.of("part")), new FileSliceStore(1024 * 1024, null, null), new TableMetadataCache(), new PlanningNotes(null, null));
 
         connector.getMetadata(null, null).getTableHandle(null, new SchemaTableName("s", "t"), Optional.empty(), Optional.empty());
 

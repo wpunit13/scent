@@ -138,7 +138,7 @@ check "no-partition passthrough"  300     "$(scalar 'SELECT count(*) FROM scent.
 pt=$(docker compose logs trino-coordinator 2>/dev/null | grep -c 'getSplits passthrough'); [ "$pt" -ge 1 ] && pt=1; check "passthrough logged" 1 "$pt"
 
 check "unconfigured table query"  hello    "$(scalar 'SELECT payload FROM scent.public.notes WHERE id=1')"
-notes_files=$(docker compose exec -T trino-worker sh -c "find /tmp/scent-cache -type f -path '*notes*' | grep -c . || true" | tr -d '\r')
+notes_files=$(docker compose exec -T trino-worker sh -c "find /tmp/scent-cache -type f -name '*.parquet' -path '*notes*' | grep -c . || true" | tr -d '\r')
 [ "${notes_files:-0}" = 0 ] && notes_uncached=1 || notes_uncached=0
 check "unconfigured table not cached" 1 "$notes_uncached"
 
@@ -155,6 +155,13 @@ after_misses=$(docker compose logs trino-worker 2>/dev/null | grep -c 'cache mis
 check "restart: no source read" 1 "$no_new"
 disk_loads=$(docker compose logs trino-worker 2>/dev/null | grep -c 'loaded slice.*from Parquet' || true); [ "$disk_loads" -ge 1 ] && disk_loads=1 || disk_loads=0
 check "restart: slice loaded from disk" 1 "$disk_loads"
+
+echo "== coordinator restart (planning notes must carry metadata across restarts)"
+docker compose restart trino-coordinator > /dev/null 2>&1
+for _ in $(seq 1 60); do
+  if curl -sf http://localhost:8080/v1/info 2>/dev/null | grep -q '"starting":false'; then break; fi
+  sleep 5
+done
 
 echo "== source outage (S7: planning survives a stopped source)"
 docker compose stop postgres > /dev/null 2>&1

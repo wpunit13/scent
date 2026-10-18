@@ -78,6 +78,21 @@
             <version>2.22.1</version>
         </dependency>
 
+        <!-- Planning notes serialize delegate handles whose fields use Optional and guava
+             collections; the SPI classes are annotated for Jackson and these modules make the
+             fields round-trip. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jdk8</artifactId>
+            <version>2.22.1</version>
+        </dependency>
+
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-guava</artifactId>
+            <version>2.22.1</version>
+        </dependency>
+
         <dependency>
             <groupId>io.opentelemetry</groupId>
             <artifactId>opentelemetry-api</artifactId>
@@ -124,6 +139,15 @@
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Test only: the planning-note round trip must survive the real delegate handle
+             classes, not just our own. -->
+        <dependency>
+            <groupId>io.trino</groupId>
+            <artifactId>trino-base-jdbc</artifactId>
+            <version>${trino.version}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
