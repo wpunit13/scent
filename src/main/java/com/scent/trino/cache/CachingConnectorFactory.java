@@ -5,6 +5,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.scent.trino.BuildInfo;
 import com.scent.trino.delegate.DelegateConnectorResolver;
+import io.airlift.units.Duration;
 import io.trino.spi.TrinoException;
 import io.trino.spi.connector.Connector;
 import io.trino.spi.connector.ConnectorContext;
@@ -23,6 +24,7 @@ import static io.trino.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
 public class CachingConnectorFactory implements ConnectorFactory {
 
     private static final String PARTITION_COLUMN_PREFIX = "cache.partition-column.";
+    private static final String REFRESH_PREFIX = "cache.refresh.";
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     private final DelegateConnectorResolver delegateResolver;
@@ -58,6 +60,16 @@ public class CachingConnectorFactory implements ConnectorFactory {
             log.info("[SCENT] cacheable tables: {}", partitionColumns);
         }
 
+        // Per-table bounded staleness (ADR-007, version:none): a configured table is planned and
+        // served from the cache for the refresh duration, then refreshed from the delegate.
+        Map<String, Duration> refreshByTable = parseRefresh(config);
+        if (refreshByTable.isEmpty()) {
+            log.info("[SCENT] no cache.refresh.<schema>.<table> entries configured; planning always contacts the delegate and slices never expire by time");
+        }
+        else {
+            log.info("[SCENT] refresh windows: {}", refreshByTable);
+        }
+
         long cacheMaxBytes = config.containsKey("cache.max-bytes")
                 ? Long.parseLong(config.get("cache.max-bytes"))
                 : 256L * 1024 * 1024;
@@ -78,9 +90,10 @@ public class CachingConnectorFactory implements ConnectorFactory {
         return CachingConnector.wrap(
                 delegateConnector,
                 partitionColumns,
-                new FileSliceStore(cacheMaxBytes, context.getTypeManager(), storageDirectory),
+                new FileSliceStore(cacheMaxBytes, context.getTypeManager(), storageDirectory, refreshByTable),
                 new TableMetadataCache(),
-                new PlanningNotes(storageDirectory, context.getTypeManager()));
+                new PlanningNotes(storageDirectory, context.getTypeManager()),
+                refreshByTable);
     }
 
     /**
@@ -136,6 +149,35 @@ public class CachingConnectorFactory implements ConnectorFactory {
                     "Config '" + key + "' must be a non-empty JSON array of column names; got: " + value);
         }
         return List.copyOf(columns);
+    }
+
+    /**
+     * Per-table bounded staleness (ADR-007 version:none): every key of the form
+     * cache.refresh.<schema>.<table> declares how long this table's slices and planning
+     * metadata may be served without contacting the delegate. Tables without an entry never
+     * expire by time.
+     */
+    static Map<String, Duration> parseRefresh(Map<String, String> config) {
+        Map<String, Duration> byTable = new HashMap<>();
+        for (Map.Entry<String, String> entry : config.entrySet()) {
+            String key = entry.getKey();
+            if (!key.startsWith(REFRESH_PREFIX)) {
+                continue;
+            }
+            String table = key.substring(REFRESH_PREFIX.length()).trim();
+            if (table.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "Config '" + key + "' has no table name; expected cache.refresh.<schema>.<table>");
+            }
+            try {
+                byTable.put(table, Duration.valueOf(entry.getValue().trim()));
+            }
+            catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException(
+                        "Config '" + key + "' must be a duration like 30s, 5m or 2h; got: " + entry.getValue(), e);
+            }
+        }
+        return Map.copyOf(byTable);
     }
 
     private static Path parseStorageDirectory(Map<String, String> config) {

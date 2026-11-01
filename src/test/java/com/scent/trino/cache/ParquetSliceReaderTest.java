@@ -19,6 +19,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -132,7 +133,7 @@ class ParquetSliceReaderTest {
 
     @Test
     void matchingSchemaIsReadFromCache(@TempDir Path directory) throws IOException {
-        FileSliceStore store = new FileSliceStore(1024 * 1024, TYPE_MANAGER, directory);
+        FileSliceStore store = new FileSliceStore(1024 * 1024, TYPE_MANAGER, directory, Map.of());
         CacheKey key = cacheKey("matching-schema");
         List<String> columnTypes = List.of("bigint", "varchar", "boolean", "double");
         try (FileSliceStore.WriteSession session = store.beginWrite(
@@ -154,7 +155,7 @@ class ParquetSliceReaderTest {
 
     @Test
     void mismatchedSchemaInvalidatesFileAndReturnsCacheMiss(@TempDir Path directory) throws IOException {
-        FileSliceStore store = new FileSliceStore(1024 * 1024, TYPE_MANAGER, directory);
+        FileSliceStore store = new FileSliceStore(1024 * 1024, TYPE_MANAGER, directory, Map.of());
         CacheKey key = cacheKey("mismatched-schema");
         List<String> storedTypes = List.of("bigint", "varchar", "boolean", "double");
         try (FileSliceStore.WriteSession session = store.beginWrite(

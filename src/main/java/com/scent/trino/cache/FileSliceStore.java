@@ -2,6 +2,7 @@ package com.scent.trino.cache;
 
 import com.scent.trino.constants.WriteResult;
 import com.scent.trino.exceptions.ParquetSchemaMismatchException;
+import io.airlift.units.Duration;
 import io.trino.spi.Page;
 import io.trino.spi.connector.ConnectorPageSource;
 import io.trino.spi.type.TypeManager;
@@ -11,6 +12,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /** Worker-local cache of Parquet slices. */
@@ -19,18 +21,40 @@ public final class FileSliceStore {
     private final long maxBytes;
     private final TypeManager typeManager;
     private final Path storageDirectory;
+    private final Map<String, Duration> refreshByTable;
 
-    public FileSliceStore(long maxBytes, TypeManager typeManager, Path storageDirectory) {
+    public FileSliceStore(long maxBytes, TypeManager typeManager, Path storageDirectory, Map<String, Duration> refreshByTable) {
         if (maxBytes <= 0) {
             throw new IllegalArgumentException("maxBytes must be positive, got: " + maxBytes);
         }
         this.maxBytes = maxBytes;
         this.typeManager = typeManager;
         this.storageDirectory = storageDirectory;
+        this.refreshByTable = Map.copyOf(refreshByTable);
     }
 
     long maxBytes() {
         return maxBytes;
+    }
+
+    /** A slice older than its table's refresh window reads as absent, so the next populate rewrites it. */
+    private boolean expired(CacheKey key, Path file) {
+        Duration refresh = refreshByTable.get(key.getTable().toString());
+        if (refresh == null) {
+            return false;
+        }
+        try {
+            long ageMillis = System.currentTimeMillis() - Files.getLastModifiedTime(file).toMillis();
+            if (ageMillis >= refresh.getValue(java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                log.debug("[SCENT] slice expired for {} (age {} ms > refresh {})", key, ageMillis, refresh);
+                return true;
+            }
+            return false;
+        }
+        catch (IOException e) {
+            log.debug("[SCENT] failed to stat slice {} for freshness: {}", key, e.toString());
+            return false;
+        }
     }
 
     Optional<ConnectorPageSource> openRead(CacheKey key, List<Integer> channelIndexes, List<String> channelTypes) {
@@ -39,6 +63,11 @@ public final class FileSliceStore {
         }
         Path file = fileFor(key);
         if (!Files.exists(file)) {
+            return Optional.empty();
+        }
+        if (expired(key, file)) {
+            // Bounded staleness (ADR-007 version:none): the slice served its refresh window, so
+            // it reads as a miss and the next populate overwrites it in place.
             return Optional.empty();
         }
         try {

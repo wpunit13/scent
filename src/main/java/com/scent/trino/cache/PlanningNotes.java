@@ -75,12 +75,13 @@ public final class PlanningNotes {
 
     public record SliceNote(ConnectorTableHandle filteredHandle) {}
 
-    /** Everything the outage fallbacks need, with the schema rebuilt into real Types. */
+    /** Everything the outage fallbacks need, with the schema rebuilt into real Types and the note's age. */
     public record TableMetadata(
             ConnectorTableHandle handle,
             Map<String, ColumnHandle> columns,
             Map<String, String> columnTypes,
-            ConnectorTableSchema schema) {}
+            ConnectorTableSchema schema,
+            long refreshedAtEpochMillis) {}
 
     /**
      * Types cannot round trip without the engine's Block and Type serdes, so the note mapper
@@ -182,7 +183,8 @@ public final class PlanningNotes {
                 readHandle(value.handle(), ConnectorTableHandle.class),
                 columns,
                 value.columnTypes(),
-                schema));
+                schema,
+                value.refreshedAtEpochMillis()));
     }
 
     public void writeSliceNote(CacheKey key, ConnectorTableHandle filteredHandle) {

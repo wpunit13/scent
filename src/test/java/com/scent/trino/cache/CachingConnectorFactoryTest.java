@@ -52,9 +52,41 @@ class CachingConnectorFactoryTest {
     }
 
     @Test
-    void rejectsEmptyTableName() {
+    void rejectsEmptyPartitionColumnTableName() {
         assertThrows(IllegalArgumentException.class,
                 () -> CachingConnectorFactory.parsePartitionColumns(Map.of(
                         "cache.partition-column.", "[\"region\"]")));
+    }
+
+    @Test
+    void parsesPerTableRefreshWindows() {
+        Map<String, io.airlift.units.Duration> parsed = CachingConnectorFactory.parseRefresh(Map.of(
+                "cache.refresh.public.metrics", "2h",
+                "cache.refresh.public.sales", "30s"));
+
+        assertEquals(2, parsed.size());
+        assertEquals(7200_000.0, parsed.get("public.metrics").getValue(java.util.concurrent.TimeUnit.MILLISECONDS));
+        assertEquals(30_000.0, parsed.get("public.sales").getValue(java.util.concurrent.TimeUnit.MILLISECONDS));
+    }
+
+    @Test
+    void noRefreshEntriesMeansNothingExpiresByTime() {
+        assertTrue(CachingConnectorFactory.parseRefresh(Map.of(
+                "delegate.connector.name", "postgresql",
+                "cache.root", "/tmp/scent-cache")).isEmpty());
+    }
+
+    @Test
+    void rejectsMalformedRefreshDuration() {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> CachingConnectorFactory.parseRefresh(Map.of(
+                        "cache.refresh.public.metrics", "2 fortnights")));
+        assertTrue(e.getMessage().contains("must be a duration"));
+    }
+
+    @Test
+    void rejectsRefreshKeyWithoutTableName() {
+        assertThrows(IllegalArgumentException.class,
+                () -> CachingConnectorFactory.parseRefresh(Map.of("cache.refresh.", "2h")));
     }
 }

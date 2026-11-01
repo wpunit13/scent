@@ -29,8 +29,8 @@ class TableMetadataCacheTest {
 
     @Test
     void handlePutAloneKeepsPreviouslyLearnedColumns() {
-        cache.put(table, null, Map.of("region", column), Map.of("region", "varchar"));
-        cache.put(table, handle, null, null);
+        cache.put(table, null, Map.of("region", column), Map.of("region", "varchar"), true);
+        cache.put(table, handle, null, null, true);
 
         assertTrue(cache.contains(table));
         assertEquals(Optional.of(handle), cache.getHandle(table));
@@ -40,8 +40,8 @@ class TableMetadataCacheTest {
 
     @Test
     void columnPutAloneKeepsPreviouslyLearnedHandle() {
-        cache.put(table, handle, null, null);
-        cache.put(table, null, Map.of("region", column), Map.of("region", "varchar"));
+        cache.put(table, handle, null, null, true);
+        cache.put(table, null, Map.of("region", column), Map.of("region", "varchar"), true);
 
         assertEquals(Optional.of(handle), cache.getHandle(table));
         assertEquals(Optional.of(Map.of("region", column)), cache.getColumns(table));
@@ -49,7 +49,7 @@ class TableMetadataCacheTest {
 
     @Test
     void differentTablesAreIndependent() {
-        cache.put(table, handle, null, null);
+        cache.put(table, handle, null, null, true);
         SchemaTableName other = new SchemaTableName("other", "table");
 
         assertFalse(cache.contains(other));

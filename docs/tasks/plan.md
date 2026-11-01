@@ -164,10 +164,24 @@ Lock scope and get a measurable yardstick before building more.
   TTL that expires the key. Lowest-risk entry to freshness.
 - Design update (2026-10-18): the same TTL governs planning metadata (T8 cache + T17 notes). The
   connector flips to cache-first: fresh entries plan with zero source contact; expired entries refresh
-  from the source; a failed refresh serves stale within a grace window, which subsumes the outage
-  fallback as a general mechanism. Criterion 3 restated: cache-first with a bounded clock, not a freeze.
+  from the source; a failed refresh fails the query, which subsumes the outage fallback as a general
+  mechanism. Criterion 3 restated: cache-first with a bounded clock, not a freeze.
+- Landed 2026-10-19. Config: per-table `cache.refresh.<schema>.<table>` (airlift Duration; unset means
+  planning always contacts the delegate and slices never expire by time). Planning: CachingMetadata
+  serves fresh entries (memory, or the table note after a restart) without delegate contact; stale or
+  unknown entries go to the delegate and a failure fails the query — the T8 fallback machinery was
+  deleted. Slices: FileSliceStore expires a slice past its table's window by file mtime, so the next
+  query repopulates it in place. Correctness guard found by the e2e run: a delegate handle rebuilt
+  from a note has lost the delegate-side predicate, so CachingTableHandle carries a
+  delegateHandleTrusted flag — note-rebuilt handles may serve cache hits but the page source refuses
+  to drive a delegate read with them; applyFilter upgrades an untrusted remembered handle through the
+  delegate whenever the same cycle proves the delegate reachable. Serialization constraint: the handle
+  keeps exactly one @JsonCreator (the 6-arg form carrying the flag); two annotated creators broke the
+  engine's typed Jackson module and failed every query at TaskUpdateRequest serialization.
 - Acceptance: a slice expires after `refresh` and is re-populated on next query.
-- Verification: unit test for TTL expiry; e2e with a tiny `refresh`.
+- Verification: unit tests for TTL expiry, cache-first planning, stale-entry failure, and the trust
+  upgrade; e2e with `cache.refresh.public.metrics=3m` covering outage-without-contact and
+  refresh-after-expiry.
 - Dependencies: Task 4, Task 17.
 
 **Task 10: `version:max_updated_at` + `immutable`/`versioned` modes.**

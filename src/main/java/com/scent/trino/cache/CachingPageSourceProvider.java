@@ -3,6 +3,7 @@ package com.scent.trino.cache;
 import com.scent.trino.constants.WriteResult;
 import io.trino.spi.Page;
 import io.trino.spi.block.Block;
+import io.trino.spi.TrinoException;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ConnectorPageSource;
 import io.trino.spi.connector.ConnectorPageSourceProvider;
@@ -19,6 +20,8 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
+import static io.trino.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
+import static java.util.Objects.requireNonNull;
 import java.util.Optional;
 
 @Slf4j
@@ -51,6 +54,16 @@ public class CachingPageSourceProvider implements ConnectorPageSourceProvider {
                     log.debug("[SCENT] cache hit for {}", caching.getCacheKey());
                     return cached.get();
                 }
+                // A note-rebuilt delegate handle has lost the delegate-side predicate, so a delegate
+                // read driven by this scan would return unfiltered rows while the scan claims a
+                // predicate. Failing loudly instead: the cache hit above stays safe, and the next
+                // successful planning cycle verifies the handle through the delegate.
+                if (table instanceof CachingTableHandle handle && !handle.isDelegateHandleTrusted()) {
+                    throw new TrinoException(GENERIC_INTERNAL_ERROR,
+                            "SCENT cannot repopulate slice " + caching.getCacheKey()
+                                    + " from the delegate: the cached delegate handle was rebuilt from a planning note and needs one "
+                                    + "successful query against the delegate to be verified again");
+                }
                 log.debug("[SCENT] cache miss for {}, populating", caching.getCacheKey());
                 ConnectorPageSource source = delegate.createPageSource(
                         transaction,
@@ -66,6 +79,12 @@ public class CachingPageSourceProvider implements ConnectorPageSourceProvider {
             // Requested column unknown to the cached layout (e.g. schema changed mid-flight):
             // degrade to the delegate read for this split.
             log.debug("[SCENT] unknown requested column for {}, passing through", caching.getCacheKey());
+            if (table instanceof CachingTableHandle handle && !handle.isDelegateHandleTrusted()) {
+                throw new TrinoException(GENERIC_INTERNAL_ERROR,
+                        "SCENT cannot read slice " + caching.getCacheKey()
+                                + " from the delegate: the cached delegate handle was rebuilt from a planning note and needs one "
+                                + "successful query against the delegate to be verified again");
+            }
             return delegate.createPageSource(
                     transaction,
                     session,

@@ -72,7 +72,7 @@ class CachingPageSourceProviderTest {
     private final ColumnHandle columnA = new ColumnHandle() {};
     private final ColumnHandle columnB = new ColumnHandle() {};
     private final RecordingDelegate delegate = new RecordingDelegate();
-    private final FileSliceStore store = new FileSliceStore(1024 * 1024, null, null);
+    private final FileSliceStore store = new FileSliceStore(1024 * 1024, null, null, Map.of());
     private final CachingPageSourceProvider provider = new CachingPageSourceProvider(delegate, store);
 
     private static Block byteBlock(int value) {
@@ -202,7 +202,7 @@ class CachingPageSourceProviderTest {
                         default -> throw new IllegalArgumentException("Unexpected type: " + typeName);
                     };
                 });
-        FileSliceStore diskStore = new FileSliceStore(1024 * 1024, typeManager, cacheDirectory);
+        FileSliceStore diskStore = new FileSliceStore(1024 * 1024, typeManager, cacheDirectory, Map.of());
         CachingPageSourceProvider diskProvider = new CachingPageSourceProvider(delegate, diskStore);
         delegate.pagesToServe = List.of(mixedPage(42, "cached text"));
         CachingSplit split = new CachingSplit(
@@ -231,7 +231,7 @@ class CachingPageSourceProviderTest {
     @Test
     void populateStreamsRawPagesAndPublishesOnlyAfterDelegateFinishes(@TempDir Path cacheDirectory) throws IOException {
         delegate.pagesToServe = List.of(bigintPage(10, 20), bigintPage(11, 21));
-        FileSliceStore diskStore = new FileSliceStore(1024 * 1024, bigintTypeManager(), cacheDirectory);
+        FileSliceStore diskStore = new FileSliceStore(1024 * 1024, bigintTypeManager(), cacheDirectory, Map.of());
         CachingPageSourceProvider diskProvider = new CachingPageSourceProvider(delegate, diskStore);
         CachingSplit split = typedSplit();
         ConnectorPageSource source = diskProvider.createPageSource(
@@ -259,7 +259,7 @@ class CachingPageSourceProviderTest {
     @Test
     void hitServesCachedPagesProjectedToRequestedOrder(@TempDir Path cacheDirectory) throws IOException {
         TypeManager typeManager = bigintTypeManager();
-        FileSliceStore diskStore = new FileSliceStore(1024 * 1024, typeManager, cacheDirectory);
+        FileSliceStore diskStore = new FileSliceStore(1024 * 1024, typeManager, cacheDirectory, Map.of());
         try (FileSliceStore.WriteSession session = diskStore.beginWrite(sliceKey(), List.of("a", "b"), List.of("bigint", "bigint"))) {
             session.write(bigintPage(1, 2));
             session.complete();
@@ -282,7 +282,7 @@ class CachingPageSourceProviderTest {
 
     @Test
     void hitWithNoRequestedColumnsStillReturnsRowCounts(@TempDir Path cacheDirectory) throws IOException {
-        FileSliceStore diskStore = new FileSliceStore(1024 * 1024, bigintTypeManager(), cacheDirectory);
+        FileSliceStore diskStore = new FileSliceStore(1024 * 1024, bigintTypeManager(), cacheDirectory, Map.of());
         try (FileSliceStore.WriteSession session = diskStore.beginWrite(
                 sliceKey(), List.of("a", "b"), List.of("bigint", "bigint"))) {
             session.write(bigintPage(1, 2));
@@ -306,7 +306,7 @@ class CachingPageSourceProviderTest {
     void hitWithoutTerminalNullStillPublishesOnClose(@TempDir Path cacheDirectory) throws IOException {
         // Delegate serves one page; consumer stops at isFinished() without polling the null
         delegate.pagesToServe = List.of(bigintPage(1, 2));
-        FileSliceStore diskStore = new FileSliceStore(1024 * 1024, bigintTypeManager(), cacheDirectory);
+        FileSliceStore diskStore = new FileSliceStore(1024 * 1024, bigintTypeManager(), cacheDirectory, Map.of());
         CachingPageSourceProvider diskProvider = new CachingPageSourceProvider(delegate, diskStore);
         CachingSplit split = typedSplit();
 
@@ -325,7 +325,7 @@ class CachingPageSourceProviderTest {
     @Test
     void closeBeforeFinishDiscardsPartialSlice(@TempDir Path cacheDirectory) throws IOException {
         delegate.pagesToServe = List.of(bigintPage(1, 2), bigintPage(3, 4));
-        FileSliceStore diskStore = new FileSliceStore(1024 * 1024, bigintTypeManager(), cacheDirectory);
+        FileSliceStore diskStore = new FileSliceStore(1024 * 1024, bigintTypeManager(), cacheDirectory, Map.of());
         CachingPageSourceProvider diskProvider = new CachingPageSourceProvider(delegate, diskStore);
         CachingSplit split = typedSplit();
 
@@ -377,7 +377,7 @@ class CachingPageSourceProviderTest {
     void oversizeSliceNeverPublishes(@TempDir Path cacheDirectory) throws IOException {
         delegate.pagesToServe = List.of(bigintPage(1, 2));
         // Cap smaller than one page: everything is over cap from the first page
-        FileSliceStore tinyStore = new FileSliceStore(1, bigintTypeManager(), cacheDirectory);
+        FileSliceStore tinyStore = new FileSliceStore(1, bigintTypeManager(), cacheDirectory, Map.of());
         CachingPageSourceProvider tinyProvider = new CachingPageSourceProvider(delegate, tinyStore);
         CachingSplit split = typedSplit();
 

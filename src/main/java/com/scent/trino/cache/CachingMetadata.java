@@ -1,5 +1,6 @@
 package com.scent.trino.cache;
 
+import io.airlift.units.Duration;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ConnectorMetadata;
 import io.trino.spi.connector.ConnectorSession;
@@ -36,18 +37,21 @@ public final class CachingMetadata implements InvocationHandler {
     private final boolean captureColumnTypes;
     private final TableMetadataCache metadataCache;
     private final PlanningNotes planningNotes;
+    private final Map<String, Duration> refreshByTable;
 
     public CachingMetadata(
             ConnectorMetadata delegate,
             Map<String, List<String>> partitionColumnsByTable,
             boolean captureColumnTypes,
             TableMetadataCache metadataCache,
-            PlanningNotes planningNotes) {
+            PlanningNotes planningNotes,
+            Map<String, Duration> refreshByTable) {
         this.delegate = Objects.requireNonNull(delegate, "delegate is null");
         this.partitionColumnsByTable = Objects.requireNonNull(partitionColumnsByTable, "partitionColumnsByTable is null");
         this.captureColumnTypes = captureColumnTypes;
         this.metadataCache = Objects.requireNonNull(metadataCache, "metadataCache is null");
         this.planningNotes = Objects.requireNonNull(planningNotes, "planningNotes is null");
+        this.refreshByTable = Map.copyOf(refreshByTable);
     }
 
     public static ConnectorMetadata wrap(
@@ -55,11 +59,12 @@ public final class CachingMetadata implements InvocationHandler {
             Map<String, List<String>> partitionColumnsByTable,
             boolean captureColumnTypes,
             TableMetadataCache metadataCache,
-            PlanningNotes planningNotes) {
+            PlanningNotes planningNotes,
+            Map<String, Duration> refreshByTable) {
         return (ConnectorMetadata) Proxy.newProxyInstance(
                 ConnectorMetadata.class.getClassLoader(),
                 new Class<?>[] {ConnectorMetadata.class},
-                new CachingMetadata(delegate, partitionColumnsByTable, captureColumnTypes, metadataCache, planningNotes));
+                new CachingMetadata(delegate, partitionColumnsByTable, captureColumnTypes, metadataCache, planningNotes, refreshByTable));
     }
 
     /**
@@ -104,19 +109,24 @@ public final class CachingMetadata implements InvocationHandler {
         }
     }
 
+    /**
+     * Cache-first (Phase 5, decision 8): a table with a refresh window plans without the delegate
+     * while its entry is fresh, in memory or on disk in a note. Stale or unknown entries go to the
+     * delegate, and a delegate failure fails the query — the cache is an accelerator, not a
+     * replacement. Tables without a refresh entry always plan through the delegate.
+     */
     private Object getTableHandle(Method method, Object[] arguments) throws Throwable {
         SchemaTableName tableName = (SchemaTableName) arguments[1];
-        Object result;
-        try {
-            result = method.invoke(delegate, arguments);
+        Optional<CachingTableHandle> fresh = freshTableHandle(tableName);
+        if (fresh.isPresent()) {
+            return fresh.get();
         }
-        catch (InvocationTargetException exception) {
-            return cachedTableHandle(tableName, unwrapCause(exception));
-        }
+        log.debug("[SCENT SPI] Forwarding ConnectorMetadata.getTableHandle to the delegate");
+        Object result = method.invoke(delegate, arguments);
         if (result == null) {
             return null;
         }
-        if (metadataCache.put(tableName, (ConnectorTableHandle) result, null, null)) {
+        if (metadataCache.put(tableName, (ConnectorTableHandle) result, null, null, true)) {
             writeTableNote(tableName);
         }
         return new CachingTableHandle(
@@ -124,45 +134,59 @@ public final class CachingMetadata implements InvocationHandler {
                 tableName,
                 TupleDomain.all(),
                 null,
-                null);
+                null,
+                true);
     }
 
-    /**
-     * S7: a table seen at least once plans without the source. The cached handle is served
-     * fresh-wrapped on source failure only; on a miss in memory and on disk the source error
-     * propagates, so a table never seen before still fails like it does today.
-     */
-    private Object cachedTableHandle(SchemaTableName tableName, Throwable sourceFailure) throws Throwable {
-        Optional<ConnectorTableHandle> cached = metadataCache.getHandle(tableName);
-        if (cached.isEmpty()) {
-            Optional<PlanningNotes.TableMetadata> noted = planningNotes.readTable(tableName);
-            if (noted.isEmpty()) {
-                throw sourceFailure;
-            }
-            PlanningNotes.TableMetadata note = noted.get();
-            metadataCache.put(tableName, note.handle(), note.columns(), note.columnTypes());
-            if (note.schema() != null) {
-                metadataCache.putSchema(tableName, note.schema());
-            }
-            log.info("[SCENT SPI] source outage: serving table handle for {} from metadata note", tableName);
-            return new CachingTableHandle(
-                    note.handle(),
+    /** Memory first, then the table note for a coordinator that restarted inside the refresh window. */
+    private Optional<CachingTableHandle> freshTableHandle(SchemaTableName tableName) {
+        Duration refresh = refreshByTable.get(tableName.toString());
+        if (refresh == null) {
+            return Optional.empty();
+        }
+        if (metadataCache.isFresh(tableName, refresh)) {
+            log.info("[SCENT SPI] serving table handle for {} from planning cache", tableName);
+            return Optional.of(new CachingTableHandle(
+                    metadataCache.getHandle(tableName).orElseThrow(),
                     tableName,
                     TupleDomain.all(),
-                    note.columns(),
-                    note.columnTypes());
+                    metadataCache.getColumns(tableName).orElse(null),
+                    metadataCache.getColumnTypes(tableName).orElse(null),
+                    metadataCache.refreshedViaDelegate(tableName)));
         }
-        log.info("[SCENT SPI] source outage: serving table handle for {} from metadata cache", tableName);
-        return new CachingTableHandle(
-                cached.get(),
+        if (metadataCache.contains(tableName)) {
+            return Optional.empty();
+        }
+        Optional<PlanningNotes.TableMetadata> noted = planningNotes.readTable(tableName);
+        if (noted.isEmpty()) {
+            return Optional.empty();
+        }
+        PlanningNotes.TableMetadata note = noted.get();
+        long ageMillis = System.currentTimeMillis() - note.refreshedAtEpochMillis();
+        if (ageMillis >= refresh.getValue(java.util.concurrent.TimeUnit.MILLISECONDS)) {
+            return Optional.empty();
+        }
+        metadataCache.put(tableName, note.handle(), note.columns(), note.columnTypes(), false);
+        if (note.schema() != null) {
+            metadataCache.putSchema(tableName, note.schema(), false);
+        }
+        log.info("[SCENT SPI] serving table handle for {} from planning note", tableName);
+        return Optional.of(new CachingTableHandle(
+                note.handle(),
                 tableName,
                 TupleDomain.all(),
-                metadataCache.getColumns(tableName).orElse(null),
-                metadataCache.getColumnTypes(tableName).orElse(null));
+                note.columns(),
+                note.columnTypes(),
+                false));
     }
 
     private Object getColumnHandles(Method method, Object[] arguments) throws Throwable {
         CachingTableHandle caching = arguments[1] instanceof CachingTableHandle handle ? handle : null;
+        // A handle served fresh already carries the learned layout, so the delegate is not asked again.
+        if (caching != null && caching.getColumnHandles() != null) {
+            log.debug("[SCENT SPI] serving column handles for {} from planning cache", caching.getSchemaTableName());
+            return caching.getColumnHandles();
+        }
         Map<String, ColumnHandle> result;
         try {
             @SuppressWarnings("unchecked")
@@ -171,7 +195,7 @@ public final class CachingMetadata implements InvocationHandler {
             result = delegateResult;
         }
         catch (InvocationTargetException exception) {
-            return cachedColumnHandles(caching, unwrapCause(exception));
+            throw unwrapCause(exception);
         }
         if (caching != null && result != null) {
             caching.attachColumns(result);
@@ -188,67 +212,37 @@ public final class CachingMetadata implements InvocationHandler {
             else {
                 types = null;
             }
-            if (metadataCache.put(caching.getSchemaTableName(), caching.getDelegateHandle(), result, types)) {
+            if (metadataCache.put(caching.getSchemaTableName(), caching.getDelegateHandle(), result, types, true)) {
                 writeTableNote(caching.getSchemaTableName());
             }
         }
         return result;
     }
 
-    private Object cachedColumnHandles(CachingTableHandle caching, Throwable sourceFailure) throws Throwable {
-        if (caching == null) {
-            throw sourceFailure;
-        }
-        Optional<Map<String, ColumnHandle>> cached = metadataCache.getColumns(caching.getSchemaTableName());
-        if (cached.isEmpty()) {
-            Optional<PlanningNotes.TableMetadata> noted = planningNotes.readTable(caching.getSchemaTableName());
-            if (noted.isEmpty() || noted.get().columns() == null) {
-                throw sourceFailure;
-            }
-            PlanningNotes.TableMetadata note = noted.get();
-            metadataCache.put(caching.getSchemaTableName(), note.handle(), note.columns(), note.columnTypes());
-            log.info("[SCENT SPI] source outage: serving column handles for {} from metadata note", caching.getSchemaTableName());
-            caching.attachColumns(note.columns());
-            return note.columns();
-        }
-        log.info("[SCENT SPI] source outage: serving column handles for {} from metadata cache", caching.getSchemaTableName());
-        caching.attachColumns(cached.get());
-        return cached.get();
-    }
-
     private Object getTableSchema(Method method, Object[] arguments) throws Throwable {
         CachingTableHandle caching = arguments[1] instanceof CachingTableHandle handle ? handle : null;
+        // The handle arrived through the fresh path, so the schema learned in the same refresh
+        // cycle is in memory and equally fresh.
+        if (caching != null && tableFresh(caching.getSchemaTableName())) {
+            Optional<ConnectorTableSchema> cached = metadataCache.getSchema(caching.getSchemaTableName());
+            if (cached.isPresent()) {
+                log.debug("[SCENT SPI] serving table schema for {} from planning cache", caching.getSchemaTableName());
+                return cached.get();
+            }
+        }
         ConnectorTableSchema result;
         try {
             result = (ConnectorTableSchema) method.invoke(delegate, unwrap(arguments));
         }
         catch (InvocationTargetException exception) {
-            return cachedTableSchema(caching, unwrapCause(exception));
+            throw unwrapCause(exception);
         }
         if (caching != null && result != null) {
-            if (metadataCache.putSchema(caching.getSchemaTableName(), result)) {
+            if (metadataCache.putSchema(caching.getSchemaTableName(), result, true)) {
                 writeTableNote(caching.getSchemaTableName());
             }
         }
         return result;
-    }
-
-    private Object cachedTableSchema(CachingTableHandle caching, Throwable sourceFailure) throws Throwable {
-        if (caching == null) {
-            throw sourceFailure;
-        }
-        Optional<ConnectorTableSchema> cached = metadataCache.getSchema(caching.getSchemaTableName());
-        if (cached.isEmpty()) {
-            Optional<PlanningNotes.TableMetadata> noted = planningNotes.readTable(caching.getSchemaTableName());
-            if (noted.isEmpty() || noted.get().schema() == null) {
-                throw sourceFailure;
-            }
-            metadataCache.putSchema(caching.getSchemaTableName(), noted.get().schema());
-            log.info("[SCENT SPI] source outage: serving table schema for {} from metadata note", caching.getSchemaTableName());
-            return noted.get().schema();
-        }
-        log.info("[SCENT SPI] source outage: serving table schema for {} from metadata cache", caching.getSchemaTableName());
-        return cached.get();
     }
 
     /**
@@ -313,6 +307,53 @@ public final class CachingMetadata implements InvocationHandler {
         // Push only the partition predicate; non-partition domains remain for Trino (C7).
         TupleDomain<ColumnHandle> merged = caching.getPartitionDomain().intersect(incomingPartition);
         log.debug("[SCENT SPI] applyFilter pushing partition domain {} onto {}", incomingPartition, caching);
+
+        // Cache-first: a fresh table entry plans without the delegate when a trusted filtered
+        // handle is remembered for this exact domain. An untrusted one (rebuilt from a note) may
+        // serve a cache hit but must never drive a delegate read presented as filtered, so it is
+        // upgraded through the delegate whenever this cycle proves the delegate reachable, and
+        // served only as an untrusted handle otherwise. Unknown domains must go through, because
+        // a slice for them does not exist yet and the source read needs the delegate anyway.
+        Optional<TableMetadataCache.RememberedFiltered> remembered = metadataCache.getFilteredHandle(caching.getSchemaTableName(), merged);
+        if (remembered.isEmpty() && tableFresh(caching.getSchemaTableName())) {
+            remembered = planningNotes.readSliceNote(CacheKey.of(caching.getSchemaTableName(), merged))
+                    .map(note -> new TableMetadataCache.RememberedFiltered(note.filteredHandle(), false));
+            if (remembered.isPresent()) {
+                metadataCache.putFilteredHandle(caching.getSchemaTableName(), merged, remembered.get().handle(), false);
+            }
+        }
+        boolean delegateProvenUp = caching.isDelegateHandleTrusted() && metadataCache.refreshedViaDelegate(caching.getSchemaTableName());
+        if (remembered.isPresent() && remembered.get().trusted()) {
+            log.info("[SCENT SPI] serving filtered handle for {} from planning cache", merged);
+            return Optional.of(new ConstraintApplicationResult<>(
+                    new CachingTableHandle(
+                            remembered.get().handle(),
+                            caching.getSchemaTableName(),
+                            merged,
+                            caching.getColumnHandles(),
+                            caching.getColumnTypes(),
+                            true),
+                    withoutPartitionColumns(summary, partitionHandles),
+                    Constant.TRUE,
+                    false));
+        }
+        if (remembered.isPresent() && !delegateProvenUp) {
+            // Serve the untrusted handle only for its cache-hit chance; the page source refuses
+            // to repopulate with it, so a miss degrades to the delegate read's own outcome.
+            log.info("[SCENT SPI] serving unverified filtered handle for {} from planning cache", merged);
+            return Optional.of(new ConstraintApplicationResult<>(
+                    new CachingTableHandle(
+                            remembered.get().handle(),
+                            caching.getSchemaTableName(),
+                            merged,
+                            caching.getColumnHandles(),
+                            caching.getColumnTypes(),
+                            false),
+                    withoutPartitionColumns(summary, partitionHandles),
+                    Constant.TRUE,
+                    false));
+        }
+
         Optional<ConstraintApplicationResult<ConnectorTableHandle>> result;
         try {
             result = (Optional<ConstraintApplicationResult<ConnectorTableHandle>>) method.invoke(
@@ -322,7 +363,26 @@ public final class CachingMetadata implements InvocationHandler {
                     new Constraint(incomingPartition));
         }
         catch (InvocationTargetException exception) {
-            return outageFilterResult(caching, merged, summary, partitionHandles);
+            // The pushdown is declined on a failed delegate call, but a remembered handle still
+            // gets its cache-hit chance: the page source refuses to repopulate with it, so a
+            // missing slice surfaces the real source error instead of wrong rows. A handle is
+            // never paired with a partition domain it was not built for (no populate poisoning).
+            if (remembered.isPresent()) {
+                log.info("[SCENT SPI] serving unverified filtered handle for {} after a failed delegate call", merged);
+                return Optional.of(new ConstraintApplicationResult<>(
+                        new CachingTableHandle(
+                                remembered.get().handle(),
+                                caching.getSchemaTableName(),
+                                merged,
+                                caching.getColumnHandles(),
+                                caching.getColumnTypes(),
+                                false),
+                        withoutPartitionColumns(summary, partitionHandles),
+                        Constant.TRUE,
+                        false));
+            }
+            log.debug("[SCENT SPI] applyFilter declined after a failed delegate call", unwrapCause(exception));
+            return Optional.empty();
         }
         if (result.isEmpty()) {
             // Delegate cannot push; Trino keeps the predicate above the scan.
@@ -333,7 +393,7 @@ public final class CachingMetadata implements InvocationHandler {
             // applied the partition predicate fully; upgrade to remaining-union if that ever bites.
             return Optional.empty();
         }
-        if (metadataCache.putFilteredHandle(caching.getSchemaTableName(), merged, result.get().getHandle())) {
+        if (metadataCache.putFilteredHandle(caching.getSchemaTableName(), merged, result.get().getHandle(), true)) {
             planningNotes.writeSliceNote(CacheKey.of(caching.getSchemaTableName(), merged), result.get().getHandle());
         }
         CachingTableHandle wrapped = new CachingTableHandle(
@@ -350,47 +410,10 @@ public final class CachingMetadata implements InvocationHandler {
                 false));
     }
 
-    /**
-     * The delegate's applyFilter opens a JDBC connection (toColumnMappings), so a source outage
-     * fails the pushdown. The delegate's rewritten handle for this exact partition domain was
-     * remembered on the last successful query, so it is replayed; with no remembered handle the
-     * pushdown is declined and the predicate stays above the scan. That keeps the populate path
-     * filtered: a delegate handle is never paired with a partition domain it was not built for.
-     */
-    private Object outageFilterResult(
-            CachingTableHandle caching,
-            TupleDomain<ColumnHandle> merged,
-            TupleDomain<ColumnHandle> summary,
-            List<ColumnHandle> partitionHandles) {
-        Optional<ConnectorTableHandle> remembered = metadataCache.getFilteredHandle(caching.getSchemaTableName(), merged);
-        boolean fromNote = false;
-        if (remembered.isEmpty()) {
-            CacheKey sliceKey = CacheKey.of(caching.getSchemaTableName(), merged);
-            Optional<PlanningNotes.SliceNote> noted = planningNotes.readSliceNote(sliceKey);
-            if (noted.isEmpty() || noted.get().filteredHandle() == null) {
-                return Optional.empty();
-            }
-            metadataCache.putFilteredHandle(caching.getSchemaTableName(), merged, noted.get().filteredHandle());
-            remembered = Optional.of(noted.get().filteredHandle());
-            fromNote = true;
-        }
-        if (fromNote) {
-            log.info("[SCENT SPI] source outage: serving filtered handle for {} {} from metadata note", caching.getSchemaTableName(), merged);
-        }
-        else {
-            log.info("[SCENT SPI] source outage: serving filtered handle for {} {} from metadata cache", caching.getSchemaTableName(), merged);
-        }
-        CachingTableHandle wrapped = new CachingTableHandle(
-                remembered.get(),
-                caching.getSchemaTableName(),
-                merged,
-                caching.getColumnHandles(),
-                caching.getColumnTypes());
-        return Optional.of(new ConstraintApplicationResult<>(
-                wrapped,
-                withoutPartitionColumns(summary, partitionHandles),
-                Constant.TRUE,
-                false));
+    /** The table's planning entry is younger than its refresh window (and it has one). */
+    private boolean tableFresh(SchemaTableName tableName) {
+        Duration refresh = refreshByTable.get(tableName.toString());
+        return refresh != null && metadataCache.isFresh(tableName, refresh);
     }
 
     private Object forwardWithFullConstraint(Method method, Object[] arguments, CachingTableHandle caching) throws Exception {

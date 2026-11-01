@@ -40,16 +40,23 @@ Queue order: T17 (durable planning notes, next) → Phase 5 (freshness, reshaped
       leans on the delegate's own getSplits being source-free (true for postgres).
 
 ## Phase 5 — Freshness (ADR-007)
-- [ ] T9: `version:none` + refresh TTL
+- [x] T9: `version:none` + refresh TTL
 - [ ] T10: `version:max_updated_at` + `immutable`/`versioned` modes
 
-> Design update (2026-10-18, revised same day per decision 8): TTL governs planning metadata as
-> well as data slices. Cache becomes the first path tried for planning: fresh entries plan with
-> zero source contact, expired entries refresh from the source, and a failed refresh fails the
-> query — there is no grace window, because the cache is an accelerator, not a delegate
-> replacement. Outage resilience for fresh entries comes free from the TTL bound. The T8 fallback
-> machinery is transitional and is deleted when cache-first lands. Requires T17 (notes) so fresh
-> entries survive a restart.
+> Design update (2026-10-18, revised same day per decision 8, landed 2026-10-19): TTL governs
+> planning metadata as well as data slices. Cache becomes the first path tried for planning:
+> fresh entries plan with zero source contact, expired entries refresh from the source, and a
+> failed refresh fails the query — there is no grace window, because the cache is an accelerator,
+> not a delegate replacement. Outage resilience for fresh entries comes free from the TTL bound.
+> The T8 fallback machinery was deleted when cache-first landed. T17 notes carry fresh entries
+> across a restart. Implementation notes: `cache.refresh.<schema>.<table>` per-table duration
+> (airlift Duration); CachingTableHandle now carries a delegateHandleTrusted flag — a handle
+> rebuilt from a planning note has lost the delegate-side predicate, so it may serve a cache hit
+> but the page source refuses to drive a delegate read with it (the T9 e2e caught a poisoned
+> slice: an expired repopulation with a note-rebuilt handle wrote the full 300-row table into the
+> us-east slice, sum 22275 instead of 7425). The flag must survive the coordinator-worker wire:
+> CachingTableHandle has exactly one @JsonCreator (the 6-arg form) — two annotated creators made
+> the engine's typed Jackson module fail every TaskUpdateRequest with conflicting-creator errors.
 
 ## Phase 6 — Local-mode production hardening
 - [ ] T11: Bucket subdivision of coarse JDBC splits (ADR-012)

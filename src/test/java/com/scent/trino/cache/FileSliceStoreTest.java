@@ -18,6 +18,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -69,13 +70,13 @@ class FileSliceStoreTest {
 
     @Test
     void disabledWithoutDiskDirectoryOrTypeManager() {
-        assertFalse(new FileSliceStore(100, TYPE_MANAGER, null).isEnabled());
-        assertFalse(new FileSliceStore(100, null, Path.of("unused")).isEnabled());
+        assertFalse(new FileSliceStore(100, TYPE_MANAGER, null, Map.of()).isEnabled());
+        assertFalse(new FileSliceStore(100, null, Path.of("unused"), Map.of()).isEnabled());
     }
 
     @Test
     void usesHierarchicalFileLayout(@TempDir Path directory) {
-        FileSliceStore store = new FileSliceStore(100, TYPE_MANAGER, directory);
+        FileSliceStore store = new FileSliceStore(100, TYPE_MANAGER, directory, Map.of());
         Path file = store.fileFor(key("orders"));
 
         assertEquals(directory.resolve("schema.orders").resolve(key("orders").canonicalPartition().replace('/', '_'))
@@ -85,7 +86,7 @@ class FileSliceStoreTest {
     @Test
     void completedSessionPublishesParquetAndCanBeReadFromANewStore(@TempDir Path directory) throws IOException {
         CacheKey key = key("persisted");
-        FileSliceStore store = new FileSliceStore(1024 * 1024, TYPE_MANAGER, directory);
+        FileSliceStore store = new FileSliceStore(1024 * 1024, TYPE_MANAGER, directory, Map.of());
         Page first = page(42, "hello");
         Page second = page(84, "world");
         try (FileSliceStore.WriteSession session = store.beginWrite(key, List.of("n", "v"), List.of("bigint", "varchar"))) {
@@ -96,7 +97,7 @@ class FileSliceStoreTest {
         }
 
         assertTrue(Files.size(store.fileFor(key)) > 0);
-        FileSliceStore freshStore = new FileSliceStore(1024 * 1024, TYPE_MANAGER, directory);
+        FileSliceStore freshStore = new FileSliceStore(1024 * 1024, TYPE_MANAGER, directory, Map.of());
         List<Page> loaded = drain(freshStore.openRead(key, List.of(0, 1), List.of("bigint", "varchar")).orElseThrow());
         assertEquals(2, loaded.size());
         assertEquals(42, BigintType.BIGINT.getLong(loaded.get(0).getBlock(0), 0));
@@ -106,9 +107,38 @@ class FileSliceStoreTest {
     }
 
     @Test
+    void expiredSliceReadsAsMissForRepopulation(@TempDir Path directory) throws Exception {
+        CacheKey key = key("ttl");
+        FileSliceStore store = new FileSliceStore(1024 * 1024, TYPE_MANAGER, directory, Map.of("schema.ttl", io.airlift.units.Duration.valueOf("0s")));
+        try (FileSliceStore.WriteSession session = store.beginWrite(key, List.of("n", "v"), List.of("bigint", "varchar"))) {
+            session.write(page(1, "stale"));
+            session.complete();
+        }
+
+        // A zero refresh window makes every slice immediately older than its window.
+        assertTrue(store.openRead(key, List.of(0, 1), List.of("bigint", "varchar")).isEmpty());
+
+        // Without a refresh entry the same slice still serves.
+        FileSliceStore noTtl = new FileSliceStore(1024 * 1024, TYPE_MANAGER, directory, Map.of());
+        assertTrue(noTtl.openRead(key, List.of(0, 1), List.of("bigint", "varchar")).isPresent());
+    }
+
+    @Test
+    void freshSliceServesWithinItsRefreshWindow(@TempDir Path directory) throws Exception {
+        CacheKey key = key("fresh");
+        FileSliceStore store = new FileSliceStore(1024 * 1024, TYPE_MANAGER, directory, Map.of("schema.fresh", io.airlift.units.Duration.valueOf("1h")));
+        try (FileSliceStore.WriteSession session = store.beginWrite(key, List.of("n", "v"), List.of("bigint", "varchar"))) {
+            session.write(page(7, "fresh"));
+            session.complete();
+        }
+
+        assertTrue(store.openRead(key, List.of(0, 1), List.of("bigint", "varchar")).isPresent());
+    }
+
+    @Test
     void readLoadsOnlyRequestedColumn(@TempDir Path directory) throws IOException {
         CacheKey key = key("projection");
-        FileSliceStore store = new FileSliceStore(1024 * 1024, TYPE_MANAGER, directory);
+        FileSliceStore store = new FileSliceStore(1024 * 1024, TYPE_MANAGER, directory, Map.of());
         try (FileSliceStore.WriteSession session = store.beginWrite(key, List.of("n", "v"), List.of("bigint", "varchar"))) {
             session.write(page(17, "only requested"));
             session.complete();
@@ -122,14 +152,14 @@ class FileSliceStoreTest {
 
     @Test
     void missingSliceIsCacheMiss(@TempDir Path directory) {
-        FileSliceStore store = new FileSliceStore(100, TYPE_MANAGER, directory);
+        FileSliceStore store = new FileSliceStore(100, TYPE_MANAGER, directory, Map.of());
         assertTrue(store.openRead(key("missing"), List.of(0), List.of("bigint")).isEmpty());
     }
 
     @Test
     void abortDeletesTemporaryFileAndDoesNotPublishSlice(@TempDir Path directory) throws IOException {
         CacheKey key = key("aborted");
-        FileSliceStore store = new FileSliceStore(1024 * 1024, TYPE_MANAGER, directory);
+        FileSliceStore store = new FileSliceStore(1024 * 1024, TYPE_MANAGER, directory, Map.of());
         FileSliceStore.WriteSession session = store.beginWrite(key, List.of("n", "v"), List.of("bigint", "varchar"));
         assertEquals(WriteResult.WRITTEN, session.write(page(1, "partial")));
 
@@ -146,7 +176,7 @@ class FileSliceStoreTest {
     void perSliceLimitAbortsOnlyThatSession(@TempDir Path directory) throws IOException {
         CacheKey tooLarge = key("large");
         CacheKey withinLimit = key("small");
-        FileSliceStore store = new FileSliceStore(40, TYPE_MANAGER, directory);
+        FileSliceStore store = new FileSliceStore(40, TYPE_MANAGER, directory, Map.of());
 
         try (FileSliceStore.WriteSession session = store.beginWrite(tooLarge, List.of("n", "v"), List.of("bigint", "varchar"))) {
             assertEquals(WriteResult.CAP_EXCEEDED, session.write(page(1, "this value pushes the page over the limit")));
@@ -162,7 +192,7 @@ class FileSliceStoreTest {
 
     @Test
     void rejectsNonPositiveLimit() {
-        assertThrows(IllegalArgumentException.class, () -> new FileSliceStore(0, TYPE_MANAGER, Path.of("unused")));
-        assertThrows(IllegalArgumentException.class, () -> new FileSliceStore(-1, TYPE_MANAGER, Path.of("unused")));
+        assertThrows(IllegalArgumentException.class, () -> new FileSliceStore(0, TYPE_MANAGER, Path.of("unused"), Map.of()));
+        assertThrows(IllegalArgumentException.class, () -> new FileSliceStore(-1, TYPE_MANAGER, Path.of("unused"), Map.of()));
     }
 }
