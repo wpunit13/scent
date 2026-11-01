@@ -220,11 +220,46 @@ Lock scope and get a measurable yardstick before building more.
 - Verification: unit test for SIEVE behavior over files; e2e with a tiny disk quota.
 - Dependencies: Task 15 (disk-only store).
 
-**Task 14: Single-flight populate (D3).**
-- Description: `ConcurrentHashMap<CacheKey, CompletableFuture<Slice>>` so concurrent misses on the same slice
-  coalesce; propagate failure; fall back to own read on abort.
-- Acceptance: N concurrent cold queries produce one source read.
-- Verification: unit test with concurrent threads; instrumented source-read count = 1.
+**Task 14: Single-flight populate (D3) — lock-file design (agreed with review 2026-10-19).**
+- Decision: on a cache miss the first populator claims the key; concurrent misses do NOT wait and do NOT write — they read the delegate for their own query, serve it uncached, and skip the write. The next query after the winner publishes hits the cache. Storm cases (e.g. 1000 concurrent cold queries on a million-row partition) do not change this: the cache is not the delegate's shield (decision 8, arch.md §3.6) — such bursts exist with or without the cache, and if they matter in production the answer is a serving layer, not cache intelligence.
+
+- **Files per slice** (partition folder):
+  - `populate.lock` — the lock. Content is either EMPTY (claimed, work not started — "claimable") or a timestamp (populate in progress, heartbeat). Never both meanings at once.
+  - `none.parquet.tmp` — the partial Parquet being written; also serves as leftover garbage when a worker dies mid-write.
+  - `none.parquet` — the published slice.
+
+- **The flow.**
+  1. *Detect:* compute the slice folder from the cache key; `none.parquet` exists AND is younger than the table's refresh window → cache hit, serve from disk, done. Otherwise miss, continue.
+  2. *Claim:* attempt create-only-if-absent on `populate.lock` (atomic at the filesystem level). Created → winner: **immediately write the current timestamp into the lock** (closing the empty window to near-zero), then populate. Create fails (file exists) → read its content and go to the loser decision.
+  3. *Winner's populate:* stream delegate pages into `none.parquet.tmp`. Refresh the lock's timestamp **on a timer** (every few seconds), independent of data arrival — a slow database read never makes a live worker look dead. On completion: atomically rename the temp file to `none.parquet` (publish), then delete the lock. On any failure: delete the temp file, delete the lock. Cleanup runs in a finally block.
+  4. *Loser's decision* (made exactly once, in the loser's own request path; no polling, no background monitors). The loser reads the lock file's content AND its modification time — two independent signals, each mapping to one decision:
+     - Lock EMPTY + lock file YOUNG (modified within the empty-lock grace) → the claimer is alive, just between claim and first write. **Back off:** read the delegate for your own query, serve uncached, write nothing.
+     - Lock EMPTY + lock file OLD → the claimer died between create and first write. **Take over** as described below.
+     - Lock has a timestamp + the timestamp is RECENT → owner actively populating. **Lose:** read the delegate for your own query, serve uncached, write nothing.
+     - Lock has a timestamp + the timestamp is STALE → owner stopped breathing. **Take over.**
+     Take over = write your own lock file with your timestamp and atomic-rename it over the old one, delete any leftover temp file, proceed as the winner.
+  5. *Publish and release:* the atomic rename is the publication (readers only ever see a complete old or complete new file); the lock is deleted in a finally block after publish or after abort.
+
+- **Heartbeat window semantics.** The timestamp-staleness threshold is NOT a populate-duration estimate — it is the maximum gap between two timestamp refreshes, which our code controls (a few seconds). The refresh rides a timer inside the populate loop, so database slowness never makes a live worker look dead; a frozen or dead worker stops refreshing and is detected within one window. The objection that killed an age-based expiry design ("different databases stall differently, no number is right") does not apply: the number bounds crash-detection latency, not populate duration.
+- **Two thresholds, both code constants (not user config).** The heartbeat window (timestamp staleness) bounds crash detection and is set by our timer period. The empty-lock grace (how long an empty lock may exist before it is considered abandoned) bounds the claim-to-first-write gap, which is milliseconds by design. Both are implementation-bound — filesystem latency and timer period — not deployment-bound, and a user setting either wrongly (an empty-grace of 0ms, say) creates takeover races for no benefit. The user-facing knob remains only `cache.refresh`.
+
+- **Edge cases and their solutions.**
+  - *Two racers in the empty window* (A creates the lock; B reads "empty" while A has not yet written its timestamp): the loser's young-empty rule now backs off instead of taking over, so the double-populate race is closed — B continues uncached while A writes its timestamp and populates. The remaining exposure is a claimer that dies within the empty-lock grace; that corpse is taken over by the next miss after the grace expires. The mtime check converts the previously accepted race into a handled case.
+  - *Slow database makes a live worker look dead:* solved by the timer-based timestamp refresh (see heartbeat semantics above). A takeover of a live-but-frozen worker is correct — a frozen JVM will never publish, and if it somehow published late, its rename competes through the atomic path; one complete file wins.
+  - *Takeover leaves a partial temp file:* the taker deletes any leftover `none.parquet.tmp` before starting its own write. The garbage never had a path to publication — rename is the only door, and the dead owner never walked through it. Housekeeping, not correction.
+  - *Two takers overwriting the lock file in place could interleave:* takeover never overwrites in place. The taker writes `populate.lock.new` and atomic-renames it over `populate.lock`; readers see the whole old or whole new content. This removes any "one write handle per file" assumption.
+  - *Winner publishes while a takeover is in progress:* the taker (acting on a just-read stale timestamp) re-populates once — one wasted populate spanning the publish instant. Both publishes write complete, correctly filtered files (both hold trusted handles, else the page-source guard fails them), so data stays correct. Accepted, vanishingly rare.
+  - *Loser's uncached read finishes before the winner publishes:* the loser served correct rows read from the delegate and wrote nothing; the winner publishes later; the next query hits the cache. No interaction.
+
+- **The trust interaction (from T9).** After a restart a worker may hold an untrusted delegate handle (rebuilt from a planning note, predicate lost). It may serve a cache hit but must never drive a delegate read presented as filtered — the page source throws instead, failing the query honestly rather than serving wrong rows. applyFilter upgrades an untrusted remembered handle through the delegate whenever the same cycle proves the delegate reachable, so repopulation gets a real filtered handle. The single-flight lock operates entirely below this layer and inherits it.
+
+- **Rejected alternatives.**
+  - *Waiters polling or blocking on the lock:* pins live queries behind another query's source read; also rejected as background heartbeat monitors outside the request path.
+  - *Age-based lock expiry:* a fixed age cannot distinguish a dead worker from a slow database; replaced by the heartbeat.
+  - *Async write inside this flow:* deferred (latency optimization only). Interaction to respect when it lands: an async write must hold the lock until publish, not until the query ends, or duplicate work re-enters through the open window.
+
+- Acceptance: exactly one completed slice per key per cold burst; on a single worker, exactly one delegate source read per cold burst (losers' duplicate uncached reads are accepted and write nothing); a claimer that dies before writing its timestamp is taken over by the next miss after the empty-lock grace; a live owner that dies mid-populate is taken over within one heartbeat window; no timers exist outside the request path; parallel populates of one key never produce a partial or wrong file.
+- Verification: unit test with concurrent threads on one key (exactly one completed slice; losers serve uncached); instrumented delegate-read count = 1 on a single worker; takeover tests for all four decision rows (young-empty backoff, old-empty takeover, fresh-heartbeat lose, stale-heartbeat takeover); shared-mode lock behavior exercised when shared mode lands.
 - Dependencies: Task 6.
 
 **Task 15: Disk-only store — FileSliceStore replaces the memory tier (ADR-014).**
@@ -320,4 +355,9 @@ Lock scope and get a measurable yardstick before building more.
    fallbacks are best-effort behavior on top of this contract, not a promise; the split-batch-after-restart
    gap is accepted behavior with no follow-up work planned; and Phase 5 cache-first ships WITHOUT a
    grace window — an expired entry whose refresh fails fails the query, so staleness is bounded by the
-   TTL alone and outage resilience for fresh entries comes free from that bound.
+   TTL alone and outage resilience for fresh entries comes free from that bound. Extension (2026-10-19,
+   same principle): the cache is not the delegate's shield either. A query storm on a cold partition is
+   the delegate's normal workload; the cache degrades to no-cache behavior during the burst and becomes
+   the win once the first populate publishes. Protecting a source from storms is the job of a serving
+   layer (materialized views, read replicas, a queryable store apps point at deliberately) — a different
+   product, explicitly out of scope. See arch.md §3.6.
