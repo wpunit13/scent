@@ -5,6 +5,7 @@ import io.trino.spi.Page;
 import io.trino.spi.block.ByteArrayBlock;
 import io.trino.spi.block.Block;
 import io.trino.spi.block.BlockBuilder;
+import io.trino.spi.TrinoException;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ConnectorPageSource;
 import io.trino.spi.connector.ConnectorPageSourceProvider;
@@ -37,6 +38,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CachingPageSourceProviderTest {
@@ -320,6 +322,76 @@ class CachingPageSourceProviderTest {
         source.close();
 
         assertTrue(Files.exists(diskStore.fileFor(sliceKey())));
+    }
+
+    @Test
+    void untrustedHandleCacheHitStillServesSliceData(@TempDir Path cacheDirectory) throws IOException {
+        // The cache-hit path serves provably correct slice bytes regardless of handle provenance.
+        FileSliceStore diskStore = new FileSliceStore(1024 * 1024, bigintTypeManager(), cacheDirectory, Map.of());
+        try (FileSliceStore.WriteSession session = diskStore.beginWrite(
+                sliceKey(), List.of("a", "b"), List.of("bigint", "bigint"))) {
+            session.write(bigintPage(1, 2));
+            session.complete();
+        }
+        CachingPageSourceProvider diskProvider = new CachingPageSourceProvider(delegate, diskStore);
+        CachingTableHandle untrusted = new CachingTableHandle(
+                new ConnectorTableHandle() {},
+                new SchemaTableName("schema", "table"),
+                withColumnDomains(Map.of(columnA, Domain.singleValue(BigintType.BIGINT, 1L))),
+                Map.of("a", columnA, "b", columnB),
+                Map.of("a", "bigint", "b", "bigint"),
+                false);
+
+        ConnectorPageSource source = diskProvider.createPageSource(
+                null, null, typedSplit(), untrusted,
+                Optional.empty(), List.of(columnA), DynamicFilter.EMPTY);
+
+        List<Page> pages = drain(source);
+        assertEquals(1, pages.size());
+        assertEquals(1L, BigintType.BIGINT.getLong(pages.get(0).getBlock(0), 0));
+        assertNull(delegate.lastSplit, "cache hit should not read from the delegate");
+    }
+
+    @Test
+    void untrustedHandleRepopulateFailsLoudlyInsteadOfServingUnfilteredRows(@TempDir Path cacheDirectory) {
+        FileSliceStore diskStore = new FileSliceStore(1024 * 1024, bigintTypeManager(), cacheDirectory, Map.of());
+        CachingPageSourceProvider diskProvider = new CachingPageSourceProvider(delegate, diskStore);
+        CachingTableHandle untrusted = new CachingTableHandle(
+                new ConnectorTableHandle() {},
+                new SchemaTableName("schema", "table"),
+                withColumnDomains(Map.of(columnA, Domain.singleValue(BigintType.BIGINT, 1L))),
+                Map.of("a", columnA, "b", columnB),
+                Map.of("a", "bigint", "b", "bigint"),
+                false);
+
+        TrinoException thrown = assertThrows(TrinoException.class, () ->
+                diskProvider.createPageSource(
+                        null, null, typedSplit(), untrusted,
+                        Optional.empty(), List.of(columnA), DynamicFilter.EMPTY));
+        assertTrue(thrown.getMessage().contains("rebuilt from a planning note"));
+        assertNull(delegate.lastSplit, "a delegate read must not be driven by an unverified handle");
+    }
+
+    @Test
+    void trustedHandleRepopulateProceeds(@TempDir Path cacheDirectory) throws IOException {
+        delegate.pagesToServe = List.of(bigintPage(1, 2));
+        FileSliceStore diskStore = new FileSliceStore(1024 * 1024, bigintTypeManager(), cacheDirectory, Map.of());
+        CachingPageSourceProvider diskProvider = new CachingPageSourceProvider(delegate, diskStore);
+        CachingTableHandle trusted = new CachingTableHandle(
+                new ConnectorTableHandle() {},
+                new SchemaTableName("schema", "table"),
+                withColumnDomains(Map.of(columnA, Domain.singleValue(BigintType.BIGINT, 1L))),
+                Map.of("a", columnA, "b", columnB),
+                Map.of("a", "bigint", "b", "bigint"),
+                true);
+
+        ConnectorPageSource source = diskProvider.createPageSource(
+                null, null, typedSplit(), trusted,
+                Optional.empty(), List.of(columnA), DynamicFilter.EMPTY);
+
+        List<Page> pages = drain(source);
+        assertEquals(1, pages.size());
+        assertTrue(Files.exists(diskStore.fileFor(sliceKey())), "trusted handle repopulates the slice");
     }
 
     @Test

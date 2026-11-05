@@ -54,6 +54,10 @@ public final class PlanningNotes {
     /** Envelope for a delegate-owned object: its concrete class plus its own JSON. */
     public record HandleRef(@JsonProperty("type") String type, @JsonProperty("json") String json) {}
 
+    /** Notes are files on disk; reflection/serialization is restricted to the classes these prefixes name. */
+    private static final List<String> ALLOWED_NAMES = List.of(
+            "com.scent.trino.cache.", "io.trino.plugin.jdbc.");
+
     private record TableNoteJson(
             HandleRef handle,
             Map<String, HandleRef> columns,
@@ -326,10 +330,16 @@ public final class PlanningNotes {
             return null;
         }
         try {
+            // The type name comes from a file on disk, so it may only name allowlisted handle
+            // classes; anything else is treated as a corrupt note rather than instantiated.
+            Class<?> named = Class.forName(ref.type());
+            if (ALLOWED_NAMES.stream().noneMatch(named.getName()::startsWith)) {
+                throw new IllegalArgumentException("handle class not allowlisted: " + ref.type());
+            }
             if (JDBC_TABLE_HANDLE.equals(ref.type())) {
                 return type.cast(jdbcTableHandleFromNote(ref.json()));
             }
-            return type.cast(mapper.readValue(ref.json(), Class.forName(ref.type()).asSubclass(type)));
+            return type.cast(mapper.readValue(ref.json(), named.asSubclass(type)));
         }
         catch (Exception e) {
             log.debug("[SCENT] failed to read planning-note object {}: {}", ref.type(), e.toString());

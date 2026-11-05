@@ -187,6 +187,10 @@ Lock scope and get a measurable yardstick before building more.
 **Task 10: `version:max_updated_at` + `immutable`/`versioned` modes.**
 - Description: per-slice `SELECT max(updated_at) …` version acquisition, `check: sync|refresh`, and the
   `immutable` (lateness) mode with optional verification query.
+- Design input carried from the PR 5 review: planning notes (T17) store a slice-note timestamp that is
+  currently never validated (a slice note is trusted as long as the TABLE entry is fresh). T10 must
+  define the note-freshness contract — immutable tables may keep notes indefinitely, versioned tables
+  may need per-domain expiry — rather than leave the timestamp as dead weight.
 - Acceptance: a mutating partition invalidates via key rotation; `immutable` tables stay stable.
 - Verification: integration test with a source-side update between queries.
 - Dependencies: Task 9.
