@@ -14,10 +14,11 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Connector-lifetime metadata fallback (S7): the delegate handle, column layout, and column
- * types of every table this connector has served at least once, keyed by table name. Planning
- * consults it when the source is unreachable; every successful delegate call refreshes the
- * entry, so the cache is a fallback, never a freeze.
+ * Connector-lifetime planning metadata for every table this connector has served, keyed by table
+ * name. Cache-first consuming paths read it when the entry is younger than the table's refresh
+ * window (T9) or, after a restart, from the planning notes that mirror it; consumers also read the
+ * remembered filtered handles and their trust flags. Every successful delegate call refreshes the
+ * entry, so it is a reflection of the source's last answers, never a freeze.
  */
 public final class TableMetadataCache {
 
@@ -122,7 +123,7 @@ public final class TableMetadataCache {
         return entry != null && entry.viaDelegate();
     }
 
-    /** True when the handle for this domain is new or changed; the signal to persist the slice note. */
+    /** True when the handle for this domain is new or changed; the signal to persist the slice note. The trusted flag is provenance for the consumers: CachingMetadata serves only trusted remembered handles without delegate contact, and CachingPageSourceProvider refuses repopulate reads with an untrusted one (its delegate-side predicate was lost when the note rebuilt it). */
     public boolean putFilteredHandle(SchemaTableName table, TupleDomain<ColumnHandle> domain, ConnectorTableHandle handle, boolean trusted) {
         Objects.requireNonNull(table, "table is null");
         Objects.requireNonNull(domain, "domain is null");

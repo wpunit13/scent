@@ -27,11 +27,17 @@ import java.util.concurrent.CompletionException;
 import static io.trino.spi.predicate.TupleDomain.withColumnDomains;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class OutageSafeSplitManagerTest {
+
+    /** Connectivity-shaped failure: the only kind the outage fallbacks are allowed to react to. */
+    private static RuntimeException outage() {
+        return new RuntimeException(new java.net.ConnectException("connection refused"));
+    }
 
     private final ConnectorSplit firstSplit = new ConnectorSplit() {};
     private final ColumnHandle column = new ColumnHandle() {};
@@ -108,7 +114,7 @@ class OutageSafeSplitManagerTest {
         ScriptedSource healthy = new ScriptedSource();
         healthy.script.add(List.of(firstSplit));
         ScriptedSource outage = new ScriptedSource();
-        RuntimeException sourceError = new RuntimeException("source down");
+        RuntimeException sourceError = outage();
         outage.script.add(sourceError);
         outage.closeFailure = new RuntimeException("close down");
         inner.sources.add(healthy);
@@ -135,9 +141,34 @@ class OutageSafeSplitManagerTest {
         ConnectorSplitSource warmup = manager.getSplits(null, null, cacheableHandle, Set.of(), Constraint.alwaysTrue());
         assertEquals(List.of(firstSplit), warmup.getNextBatch(10, DynamicFilterSnapshot.EMPTY).join());
 
-        inner.syncFailure = new RuntimeException("source down");
+        inner.syncFailure = outage();
         ConnectorSplitSource duringOutage = manager.getSplits(null, null, cacheableHandle, Set.of(), Constraint.alwaysTrue());
         assertEquals(List.of(firstSplit), duringOutage.getNextBatch(10, DynamicFilterSnapshot.EMPTY).join());
+        assertTrue(duringOutage.isFinished());
+    }
+
+    @Test
+    void replayRespectsTheCallerBatchSize() {
+        ConnectorSplit second = new ConnectorSplit() {};
+        ConnectorSplit third = new ConnectorSplit() {};
+        StubSplitManager inner = new StubSplitManager();
+        OutageSafeSplitManager manager = new OutageSafeSplitManager(inner);
+        ScriptedSource healthy = new ScriptedSource();
+        healthy.script.add(List.of(firstSplit, second, third));
+        inner.sources.add(healthy);
+
+        ConnectorSplitSource warmup = manager.getSplits(null, null, cacheableHandle, Set.of(), Constraint.alwaysTrue());
+        assertEquals(List.of(firstSplit, second, third), warmup.getNextBatch(10, DynamicFilterSnapshot.EMPTY).join());
+
+        ScriptedSource outage = new ScriptedSource();
+        outage.script.add(outage());
+        outage.script.add(outage());
+        inner.sources.add(outage);
+
+        ConnectorSplitSource duringOutage = manager.getSplits(null, null, cacheableHandle, Set.of(), Constraint.alwaysTrue());
+        assertEquals(List.of(firstSplit, second), duringOutage.getNextBatch(2, DynamicFilterSnapshot.EMPTY).join());
+        assertFalse(duringOutage.isFinished());
+        assertEquals(List.of(third), duringOutage.getNextBatch(2, DynamicFilterSnapshot.EMPTY).join());
         assertTrue(duringOutage.isFinished());
     }
 
@@ -146,14 +177,13 @@ class OutageSafeSplitManagerTest {
         StubSplitManager inner = new StubSplitManager();
         OutageSafeSplitManager manager = new OutageSafeSplitManager(inner);
         ScriptedSource outage = new ScriptedSource();
-        RuntimeException sourceError = new RuntimeException("source down");
-        outage.script.add(sourceError);
+        outage.script.add(outage());
         inner.sources.add(outage);
 
         ConnectorSplitSource source = manager.getSplits(null, null, cacheableHandle, Set.of(), Constraint.alwaysTrue());
         CompletionException thrown = assertThrows(CompletionException.class,
                 () -> source.getNextBatch(10, DynamicFilterSnapshot.EMPTY).join());
-        assertSame(sourceError, rootCause(thrown));
+        assertInstanceOf(java.net.ConnectException.class, rootCause(thrown));
     }
 
     @Test
@@ -162,15 +192,14 @@ class OutageSafeSplitManagerTest {
         OutageSafeSplitManager manager = new OutageSafeSplitManager(inner);
         ScriptedSource partiallyRead = new ScriptedSource();
         partiallyRead.script.add(List.of(firstSplit));
-        RuntimeException sourceError = new RuntimeException("source down");
-        partiallyRead.script.add(sourceError);
+        partiallyRead.script.add(outage());
         inner.sources.add(partiallyRead);
 
         ConnectorSplitSource source = manager.getSplits(null, null, cacheableHandle, Set.of(), Constraint.alwaysTrue());
         assertEquals(List.of(firstSplit), source.getNextBatch(10, DynamicFilterSnapshot.EMPTY).join());
         CompletionException thrown = assertThrows(CompletionException.class,
                 () -> source.getNextBatch(10, DynamicFilterSnapshot.EMPTY).join());
-        assertSame(sourceError, rootCause(thrown));
+        assertInstanceOf(java.net.ConnectException.class, rootCause(thrown));
     }
 
     @Test
@@ -178,8 +207,7 @@ class OutageSafeSplitManagerTest {
         StubSplitManager inner = new StubSplitManager();
         OutageSafeSplitManager manager = new OutageSafeSplitManager(inner);
         ScriptedSource outage = new ScriptedSource();
-        RuntimeException sourceError = new RuntimeException("source down");
-        outage.script.add(sourceError);
+        outage.script.add(outage());
         inner.sources.add(outage);
 
         CachingTableHandle uncached = new CachingTableHandle(
@@ -191,7 +219,50 @@ class OutageSafeSplitManagerTest {
         ConnectorSplitSource source = manager.getSplits(null, null, uncached, Set.of(), Constraint.alwaysTrue());
         CompletionException thrown = assertThrows(CompletionException.class,
                 () -> source.getNextBatch(10, DynamicFilterSnapshot.EMPTY).join());
-        assertSame(sourceError, rootCause(thrown));
+        assertInstanceOf(java.net.ConnectException.class, rootCause(thrown));
+    }
+
+    @Test
+    void nonConnectivityFailureIsNotMistakenForAnOutage() {
+        StubSplitManager inner = new StubSplitManager();
+        OutageSafeSplitManager manager = new OutageSafeSplitManager(inner);
+        ScriptedSource healthy = new ScriptedSource();
+        healthy.script.add(List.of(firstSplit));
+        ScriptedSource buggy = new ScriptedSource();
+        RuntimeException bug = new NullPointerException("delegate bug");
+        buggy.script.add(bug);
+        inner.sources.add(healthy);
+        inner.sources.add(buggy);
+
+        ConnectorSplitSource warmup = manager.getSplits(null, null, cacheableHandle, Set.of(), Constraint.alwaysTrue());
+        warmup.getNextBatch(10, DynamicFilterSnapshot.EMPTY).join();
+
+        // A remembered batch exists, but a NullPointerException is a bug, not an outage;
+        // the failure must propagate instead of replaying stale work.
+        ConnectorSplitSource source = manager.getSplits(null, null, cacheableHandle, Set.of(), Constraint.alwaysTrue());
+        CompletionException thrown = assertThrows(CompletionException.class,
+                () -> source.getNextBatch(10, DynamicFilterSnapshot.EMPTY).join());
+        assertSame(bug, rootCause(thrown));
+    }
+
+    @Test
+    void connectivityFailureReplaysTheRememberedBatch() {
+        StubSplitManager inner = new StubSplitManager();
+        OutageSafeSplitManager manager = new OutageSafeSplitManager(inner);
+        ScriptedSource healthy = new ScriptedSource();
+        healthy.script.add(List.of(firstSplit));
+        ScriptedSource outage = new ScriptedSource();
+        RuntimeException connectivity = new RuntimeException(new java.net.ConnectException("connection refused"));
+        outage.script.add(connectivity);
+        inner.sources.add(healthy);
+        inner.sources.add(outage);
+
+        ConnectorSplitSource warmup = manager.getSplits(null, null, cacheableHandle, Set.of(), Constraint.alwaysTrue());
+        warmup.getNextBatch(10, DynamicFilterSnapshot.EMPTY).join();
+
+        ConnectorSplitSource duringOutage = manager.getSplits(null, null, cacheableHandle, Set.of(), Constraint.alwaysTrue());
+        assertEquals(List.of(firstSplit), duringOutage.getNextBatch(10, DynamicFilterSnapshot.EMPTY).join());
+        assertTrue(duringOutage.isFinished());
     }
 
     private static Throwable rootCause(Throwable thrown) {

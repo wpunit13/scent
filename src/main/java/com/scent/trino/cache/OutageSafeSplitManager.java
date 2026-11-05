@@ -55,7 +55,12 @@ public final class OutageSafeSplitManager implements ConnectorSplitManager {
             catch (RuntimeException e) {
                 // The delegate builds its split source eagerly and that path opens a JDBC
                 // connection (BaseJdbcClient#toColumnMappings), so the failure can surface
-                // before any split source exists.
+                // before any split source exists. Only genuine source unavailability triggers
+                // the replay; any other failure (a bug in the delegate or in this plugin)
+                // propagates instead of being masked.
+                if (!SourceAvailability.isSourceUnavailable(e)) {
+                    throw e;
+                }
                 List<ConnectorSplit> remembered = lastBatchBySlice.get(cacheKey);
                 if (remembered == null) {
                     throw e;
@@ -76,10 +81,11 @@ public final class OutageSafeSplitManager implements ConnectorSplitManager {
     private final class RememberingSplitSource implements ConnectorSplitSource {
         private final ConnectorSplitSource delegate;
         private final CacheKey cacheKey;
-        // The delegate future can complete on a worker thread; these flags are read by the
-        // scheduler thread afterwards.
+        // The delegate future can complete on a worker thread; these fields are read by the
+        // scheduler thread afterwards, so they are volatile.
         private volatile boolean produced;
         private volatile boolean replayed;
+        private volatile int replayedCount;
 
         private RememberingSplitSource(ConnectorSplitSource delegate, CacheKey cacheKey) {
             this.delegate = delegate;
@@ -100,12 +106,22 @@ public final class OutageSafeSplitManager implements ConnectorSplitManager {
                         // A replay is only safe before this source produced anything; mid-stream
                         // failures must propagate or the remembered batch would double-count.
                         List<ConnectorSplit> remembered = produced ? null : lastBatchBySlice.get(cacheKey);
-                        if (remembered == null) {
+                        if (remembered == null || !SourceAvailability.isSourceUnavailable(error)) {
                             throw unwrap(error);
                         }
-                        replayed = true;
-                        log.info("[SCENT SPI] source outage: serving splits for {} from the last known batch", cacheKey);
-                        return remembered;
+                        // The remembered batch may exceed maxSize (it was produced by an earlier
+                        // call with a different limit), so it is chunked exactly the way
+                        // FixedSplitSource does: the caller never receives more work per batch
+                        // than it requested.
+                        int from = replayedCount;
+                        int to = Math.min(remembered.size(), from + maxSize);
+                        if (from >= to) {
+                            throw unwrap(error);
+                        }
+                        replayedCount = to;
+                        replayed = to >= remembered.size();
+                        log.info("[SCENT SPI] source outage: serving splits {}/{} for {} from the last known batch", from, to, cacheKey);
+                        return remembered.subList(from, to);
                     });
         }
 
