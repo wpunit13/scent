@@ -127,7 +127,7 @@ class CachingPageSourceProviderTest {
     private CacheKey sliceKey() {
         return CacheKey.of(
                 new SchemaTableName("schema", "table"),
-                withColumnDomains(Map.of(columnA, Domain.singleValue(BigintType.BIGINT, 1L))));
+                withColumnDomains(Map.of("a", Domain.singleValue(BigintType.BIGINT, 1L))));
     }
 
     private static List<Page> drain(ConnectorPageSource source) throws IOException {
@@ -208,7 +208,7 @@ class CachingPageSourceProviderTest {
         CachingPageSourceProvider diskProvider = new CachingPageSourceProvider(delegate, diskStore);
         delegate.pagesToServe = List.of(mixedPage(42, "cached text"));
         CachingSplit split = new CachingSplit(
-                CacheKey.of(new SchemaTableName("schema", "table"), withColumnDomains(Map.of(columnA, Domain.singleValue(BigintType.BIGINT, 1L)))),
+                CacheKey.of(new SchemaTableName("schema", "table"), withColumnDomains(Map.of("a", Domain.singleValue(BigintType.BIGINT, 1L)))),
                 Map.of("a", columnA, "b", columnB),
                 Map.of("b", "varchar", "a", "bigint"),
                 new ConnectorSplit() {},

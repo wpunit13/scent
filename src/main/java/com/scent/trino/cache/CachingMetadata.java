@@ -80,7 +80,11 @@ public final class CachingMetadata implements InvocationHandler {
             "applySample",
             "applyTopN",
             "applyPartitioning",
-            "applyTableScanRedirect");
+            "applyTableScanRedirect",
+            "applyJoin",
+            "applyTableFunction",
+            "applyDelete",
+            "applyUpdate");
 
     @Override
     public Object invoke(Object proxy, Method method, Object[] arguments) throws Throwable {
@@ -93,9 +97,11 @@ public final class CachingMetadata implements InvocationHandler {
                 case "applyFilter" -> applyFilter(method, arguments);
                 default -> {
                     if (HANDLE_REWRITING_METHODS.contains(method.getName())
-                            && arguments[1] instanceof CachingTableHandle) {
+                            && containsCachingHandle(arguments)) {
                         // Optional<...>-returning pushdown hooks: decline so Trino plans the
                         // rewrite above the scan instead of folding it into the delegate handle.
+                        // applyDelete/applyUpdate are declined too: the wrapper has no invalidation
+                        // path, so forwarding a write would serve stale cached rows afterwards.
                         log.debug("[SCENT SPI] Declining ConnectorMetadata.{} to preserve the caching table handle", method.getName());
                         yield Optional.empty();
                     }
@@ -117,7 +123,9 @@ public final class CachingMetadata implements InvocationHandler {
      */
     private Object getTableHandle(Method method, Object[] arguments) throws Throwable {
         SchemaTableName tableName = (SchemaTableName) arguments[1];
-        Optional<CachingTableHandle> fresh = freshTableHandle(tableName);
+        Optional<CachingTableHandle> fresh = hasRequestedVersion(arguments)
+                ? Optional.empty()
+                : freshTableHandle(tableName);
         if (fresh.isPresent()) {
             return fresh.get();
         }
@@ -126,9 +134,12 @@ public final class CachingMetadata implements InvocationHandler {
         if (result == null) {
             return null;
         }
-        if (metadataCache.put(tableName, (ConnectorTableHandle) result, null, null, true)) {
-            writeTableNote(tableName);
-        }
+        // Every delegate confirmation rewrites the planning note: the note's timestamp means
+        // "the delegate last confirmed this metadata", not "the values last changed". A stable
+        // table would otherwise freeze its note at first-write time and expire it while the
+        // delegate had in fact just answered. Bounded by the refresh cycle, not per query.
+        metadataCache.put(tableName, (ConnectorTableHandle) result, null, null, true);
+        writeTableNote(tableName);
         return new CachingTableHandle(
                 (ConnectorTableHandle) result,
                 tableName,
@@ -184,8 +195,16 @@ public final class CachingMetadata implements InvocationHandler {
         CachingTableHandle caching = arguments[1] instanceof CachingTableHandle handle ? handle : null;
         // A handle served fresh already carries the learned layout, so the delegate is not asked again.
         if (caching != null && caching.getColumnHandles() != null) {
+            Map<String, ColumnHandle> columns = caching.getColumnHandles();
+            // A note-rebuilt handle may carry columns but not their types; re-capture so the
+            // slice write has type metadata instead of being rejected as incomplete on every populate.
+            if (captureColumnTypes && caching.getColumnTypes() == null) {
+                learnColumnTypes((ConnectorSession) arguments[0], caching, columns);
+                metadataCache.put(caching.getSchemaTableName(), caching.getDelegateHandle(), columns, caching.getColumnTypes(), true);
+                writeTableNote(caching.getSchemaTableName());
+            }
             log.debug("[SCENT SPI] serving column handles for {} from planning cache", caching.getSchemaTableName());
-            return caching.getColumnHandles();
+            return columns;
         }
         Map<String, ColumnHandle> result;
         try {
@@ -199,24 +218,24 @@ public final class CachingMetadata implements InvocationHandler {
         }
         if (caching != null && result != null) {
             caching.attachColumns(result);
-            Map<String, String> types;
+            Map<String, String> types = null;
             if (captureColumnTypes) {
-                ConnectorSession session = (ConnectorSession) arguments[0];
-                Map<String, String> captured = new HashMap<>();
-                result.forEach((name, column) -> captured.put(
-                        name,
-                        delegate.getColumnMetadata(session, caching.getDelegateHandle(), column).getType().getTypeId().getId()));
-                caching.attachColumnTypes(captured);
-                types = captured;
+                learnColumnTypes((ConnectorSession) arguments[0], caching, result);
+                types = caching.getColumnTypes();
             }
-            else {
-                types = null;
-            }
-            if (metadataCache.put(caching.getSchemaTableName(), caching.getDelegateHandle(), result, types, true)) {
-                writeTableNote(caching.getSchemaTableName());
-            }
+            metadataCache.put(caching.getSchemaTableName(), caching.getDelegateHandle(), result, types, true);
+            writeTableNote(caching.getSchemaTableName());
         }
         return result;
+    }
+
+    /** Learns and attaches the delegate's type ids for this table's columns. */
+    private void learnColumnTypes(ConnectorSession session, CachingTableHandle caching, Map<String, ColumnHandle> columns) {
+        Map<String, String> captured = new HashMap<>();
+        columns.forEach((name, column) -> captured.put(
+                name,
+                delegate.getColumnMetadata(session, caching.getDelegateHandle(), column).getType().getTypeId().getId()));
+        caching.attachColumnTypes(captured);
     }
 
     private Object getTableSchema(Method method, Object[] arguments) throws Throwable {
@@ -238,9 +257,8 @@ public final class CachingMetadata implements InvocationHandler {
             throw unwrapCause(exception);
         }
         if (caching != null && result != null) {
-            if (metadataCache.putSchema(caching.getSchemaTableName(), result, true)) {
-                writeTableNote(caching.getSchemaTableName());
-            }
+            metadataCache.putSchema(caching.getSchemaTableName(), result, true);
+            writeTableNote(caching.getSchemaTableName());
         }
         return result;
     }
@@ -264,6 +282,11 @@ public final class CachingMetadata implements InvocationHandler {
 
     /** Persists the table's current planning entry; nulls inside keep the previously noted fields. */
     private void writeTableNote(SchemaTableName tableName) {
+        // The note is only read back in freshTableHandle, which requires a refresh window; for
+        // tables without one the delegate is always contacted, so a per-query disk write is wasted.
+        if (!refreshByTable.containsKey(tableName.toString())) {
+            return;
+        }
         Optional<ConnectorTableHandle> handle = metadataCache.getHandle(tableName);
         if (handle.isEmpty()) {
             return;
@@ -283,7 +306,7 @@ public final class CachingMetadata implements InvocationHandler {
         ConnectorSession session = (ConnectorSession) arguments[0];
         Constraint constraint = (Constraint) arguments[2];
         TupleDomain<ColumnHandle> summary = constraint.getSummary();
-        List<ColumnHandle> partitionHandles = resolvePartitionHandles(session, caching);
+        Map<String, ColumnHandle> partitionHandles = resolvePartitionHandles(session, caching);
 
         TupleDomain<ColumnHandle> incomingPartition = partitionDomainFor(summary, partitionHandles);
         if (incomingPartition.isAll()) {
@@ -316,14 +339,14 @@ public final class CachingMetadata implements InvocationHandler {
         // a slice for them does not exist yet and the source read needs the delegate anyway.
         Optional<TableMetadataCache.RememberedFiltered> remembered = metadataCache.getFilteredHandle(caching.getSchemaTableName(), merged);
         if (remembered.isEmpty() && tableFresh(caching.getSchemaTableName())) {
-            remembered = planningNotes.readSliceNote(CacheKey.of(caching.getSchemaTableName(), merged))
+            remembered = planningNotes.readSliceNote(CacheKey.of(caching.getSchemaTableName(), CacheKey.nameKeyed(merged, partitionHandles)))
                     .map(note -> new TableMetadataCache.RememberedFiltered(note.filteredHandle(), false));
             if (remembered.isPresent()) {
                 metadataCache.putFilteredHandle(caching.getSchemaTableName(), merged, remembered.get().handle(), false);
             }
         }
         boolean delegateProvenUp = caching.isDelegateHandleTrusted() && metadataCache.refreshedViaDelegate(caching.getSchemaTableName());
-        if (remembered.isPresent() && remembered.get().trusted()) {
+        if (remembered.isPresent() && remembered.get().trusted() && tableFresh(caching.getSchemaTableName())) {
             log.info("[SCENT SPI] serving filtered handle for {} from planning cache", merged);
             return Optional.of(new ConstraintApplicationResult<>(
                     new CachingTableHandle(
@@ -394,7 +417,7 @@ public final class CachingMetadata implements InvocationHandler {
             return Optional.empty();
         }
         if (metadataCache.putFilteredHandle(caching.getSchemaTableName(), merged, result.get().getHandle(), true)) {
-            planningNotes.writeSliceNote(CacheKey.of(caching.getSchemaTableName(), merged), result.get().getHandle());
+            planningNotes.writeSliceNote(CacheKey.of(caching.getSchemaTableName(), CacheKey.nameKeyed(merged, partitionHandles)), result.get().getHandle());
         }
         CachingTableHandle wrapped = new CachingTableHandle(
                 result.get().getHandle(),
@@ -405,8 +428,7 @@ public final class CachingMetadata implements InvocationHandler {
         return Optional.of(new ConstraintApplicationResult<>(
                 wrapped,
                 withoutPartitionColumns(summary, partitionHandles),
-                // remaining domains are authoritative; TRUE is the sanctioned no-expression value
-                Constant.TRUE,
+                result.get().getRemainingExpression().orElseGet(() -> Constant.TRUE),
                 false));
     }
 
@@ -443,22 +465,22 @@ public final class CachingMetadata implements InvocationHandler {
      * The configured grain columns of this table, resolved against the delegate's column handles.
      * An unconfigured table, or a configured column the table does not have, contributes nothing.
      */
-    private List<ColumnHandle> resolvePartitionHandles(ConnectorSession session, CachingTableHandle caching) {
+    private Map<String, ColumnHandle> resolvePartitionHandles(ConnectorSession session, CachingTableHandle caching) {
         List<String> configured = partitionColumnsByTable.getOrDefault(
                 caching.getSchemaTableName().toString(), List.of());
         if (configured.isEmpty()) {
-            return List.of();
+            return Map.of();
         }
         // Learned columns from the last successful getColumnHandles; the delegate call is the
         // fallback for a table whose columns were never captured (also removes a duplicate
         // source round-trip on the happy path).
         Map<String, ColumnHandle> columns = metadataCache.getColumns(caching.getSchemaTableName())
                 .orElseGet(() -> delegate.getColumnHandles(session, caching.getDelegateHandle()));
-        List<ColumnHandle> handles = new ArrayList<>();
+        Map<String, ColumnHandle> handles = new LinkedHashMap<>();
         for (String column : configured) {
             ColumnHandle handle = columns.get(column);
             if (handle != null) {
-                handles.add(handle);
+                handles.put(column, handle);
             }
         }
         return handles;
@@ -469,7 +491,7 @@ public final class CachingMetadata implements InvocationHandler {
      * them is constrained (unknown column, missing from this table, or simply unconstrained).
      * Partial grains are cached as coarser slices (ADR-013).
      */
-    private static TupleDomain<ColumnHandle> partitionDomainFor(TupleDomain<ColumnHandle> summary, List<ColumnHandle> partitionHandles) {
+    private static TupleDomain<ColumnHandle> partitionDomainFor(TupleDomain<ColumnHandle> summary, Map<String, ColumnHandle> partitionHandles) {
         if (partitionHandles.isEmpty()) {
             return TupleDomain.all();
         }
@@ -478,7 +500,7 @@ public final class CachingMetadata implements InvocationHandler {
             return TupleDomain.all();
         }
         Map<ColumnHandle, Domain> present = new LinkedHashMap<>();
-        for (ColumnHandle handle : partitionHandles) {
+        for (ColumnHandle handle : partitionHandles.values()) {
             Domain domain = domains.get(handle);
             if (domain != null) {
                 present.put(handle, domain);
@@ -490,10 +512,10 @@ public final class CachingMetadata implements InvocationHandler {
         return withColumnDomains(present);
     }
 
-    private static TupleDomain<ColumnHandle> withoutPartitionColumns(TupleDomain<ColumnHandle> summary, List<ColumnHandle> partitionHandles) {
+    private static TupleDomain<ColumnHandle> withoutPartitionColumns(TupleDomain<ColumnHandle> summary, Map<String, ColumnHandle> partitionHandles) {
         Map<ColumnHandle, Domain> domains = summary.getDomains().orElseThrow();
         Map<ColumnHandle, Domain> remaining = new HashMap<>(domains);
-        remaining.keySet().removeAll(partitionHandles);
+        remaining.keySet().removeAll(partitionHandles.values());
         if (remaining.isEmpty()) {
             return TupleDomain.all();
         }
@@ -510,5 +532,24 @@ public final class CachingMetadata implements InvocationHandler {
             }
         }
         return arguments;
+    }
+
+    /** True when any argument carries our table handle, regardless of its position. */
+    private static boolean containsCachingHandle(Object[] arguments) {
+        if (arguments == null) {
+            return false;
+        }
+        for (Object argument : arguments) {
+            if (argument instanceof CachingTableHandle) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** True when the request pins a table version (time travel); a versioned scan must not be served from the cache. */
+    private static boolean hasRequestedVersion(Object[] arguments) {
+        return (arguments.length > 2 && arguments[2] instanceof Optional<?> requestedVersion && requestedVersion.isPresent())
+                || (arguments.length > 3 && arguments[3] instanceof Optional<?> retryVersion && retryVersion.isPresent());
     }
 }

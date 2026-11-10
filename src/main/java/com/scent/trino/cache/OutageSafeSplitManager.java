@@ -47,7 +47,7 @@ public final class OutageSafeSplitManager implements ConnectorSplitManager {
             Set<ColumnHandle> columns,
             Constraint constraint) {
         if (table instanceof CachingTableHandle caching && isCacheable(caching)) {
-            CacheKey cacheKey = CacheKey.of(caching.getSchemaTableName(), caching.getPartitionDomain());
+            CacheKey cacheKey = CacheKey.of(caching.getSchemaTableName(), CacheKey.nameKeyed(caching.getPartitionDomain(), caching.getColumnHandles()));
             ConnectorSplitSource source;
             try {
                 source = delegate.getSplits(transaction, session, table, columns, constraint);
@@ -129,6 +129,9 @@ public final class OutageSafeSplitManager implements ConnectorSplitManager {
         public boolean isFinished() {
             if (replayed) {
                 return true;
+            }
+            if (replayedCount > 0) {
+                return false;
             }
             return delegate.isFinished();
         }

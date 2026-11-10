@@ -7,6 +7,8 @@ import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
 
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.stream.Collectors;
@@ -16,16 +18,20 @@ import java.util.stream.Collectors;
  * it, and the source content version. Two slices are the same cached unit only when all three
  * match. A version change rotates the key, which makes the stale entry unreachable instead of
  * needing an explicit invalidation (ADR-004).
+ *
+ * <p>The partition is keyed by column name (not ColumnHandle) so on-disk identity and in-memory
+ * equality agree: column names are unique and deterministic within a table, whereas a generic
+ * ColumnHandle.toString() is not guaranteed to be injective.
  */
 public final class CacheKey {
     private final SchemaTableName table;
-    private final TupleDomain<ColumnHandle> partition;
+    private final TupleDomain<String> partition;
     private final String version;
 
     @JsonCreator
     public CacheKey(
             @JsonProperty("table") SchemaTableName table,
-            @JsonProperty("partition") TupleDomain<ColumnHandle> partition,
+            @JsonProperty("partition") TupleDomain<String> partition,
             @JsonProperty("version") String version) {
         this.table = Objects.requireNonNull(table, "table is null");
         this.partition = Objects.requireNonNull(partition, "partition is null");
@@ -33,8 +39,29 @@ public final class CacheKey {
     }
 
     /** Version defaults to none until ADR-007 freshness supplies a real value. */
-    public static CacheKey of(SchemaTableName table, TupleDomain<ColumnHandle> partition) {
+    public static CacheKey of(SchemaTableName table, TupleDomain<String> partition) {
         return new CacheKey(table, partition, "none");
+    }
+
+    /**
+     * Rebuilds a handle-keyed partition domain as a name-keyed one. Column names are unique and
+     * deterministic within a table, so this is the canonical identity used for both equality and
+     * the on-disk path.
+     */
+    public static TupleDomain<String> nameKeyed(TupleDomain<ColumnHandle> partition, Map<String, ColumnHandle> columnsByName) {
+        if (partition.isAll() || partition.isNone()) {
+            return partition.isNone() ? TupleDomain.none() : TupleDomain.all();
+        }
+        Map<ColumnHandle, String> nameByHandle = new HashMap<>();
+        columnsByName.forEach((name, handle) -> nameByHandle.put(handle, name));
+        Map<String, Domain> byName = new LinkedHashMap<>();
+        partition.getDomains().orElse(Map.of()).forEach((handle, domain) -> {
+            String name = nameByHandle.get(handle);
+            if (name != null) {
+                byName.put(name, domain);
+            }
+        });
+        return TupleDomain.withColumnDomains(byName);
     }
 
     @JsonProperty
@@ -44,7 +71,7 @@ public final class CacheKey {
     }
 
     @JsonProperty
-    public TupleDomain<ColumnHandle> getPartition()
+    public TupleDomain<String> getPartition()
     {
         return partition;
     }
@@ -57,8 +84,7 @@ public final class CacheKey {
 
     /**
      * Filesystem-safe identity string, used for the parquet filename. Percent-encodes the
-     * characters Hadoop's URI-based path handling rejects. ponytail: the partition half still
-     * reflects TupleDomain.toString(); a structural rendering is a later concern.
+     * characters Hadoop's URI-based path handling rejects.
      */
     public String pathSegment()
     {
@@ -66,18 +92,17 @@ public final class CacheKey {
     }
 
     /**
-     * Canonical rendering of the partition domains, entries sorted by column so the on-disk
-     * layout is identical on every worker regardless of map iteration order (ADR-013). Matches
-     * TupleDomain.toString() for a single column, so existing layouts stay valid.
+     * Canonical rendering of the partition domains, entries sorted by column name so the on-disk
+     * layout is identical on every worker regardless of map iteration order (ADR-013).
      */
     public String canonicalPartition()
     {
-        Map<ColumnHandle, Domain> domains = partition.getDomains().orElse(Map.of());
+        Map<String, Domain> domains = partition.getDomains().orElse(Map.of());
         if (domains.isEmpty()) {
             return partition.toString();
         }
         String joined = domains.entrySet().stream()
-                .sorted(Map.Entry.comparingByKey((a, b) -> a.toString().compareTo(b.toString())))
+                .sorted(Map.Entry.comparingByKey())
                 .map(entry -> entry.getKey() + "=" + entry.getValue())
                 .collect(Collectors.joining(", "));
         return "{" + joined + "}";

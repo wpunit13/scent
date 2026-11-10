@@ -21,8 +21,8 @@ public final class CachingTableHandle implements ConnectorTableHandle {
     private final ConnectorTableHandle delegateHandle;
     private final SchemaTableName schemaTableName;
     private final TupleDomain<ColumnHandle> partitionDomain;
-    private Map<String, ColumnHandle> columnHandles;
-    private Map<String, String> columnTypes;
+    private volatile Map<String, ColumnHandle> columnHandles;
+    private volatile Map<String, String> columnTypes;
     /**
      * False when the delegate handle was rebuilt from a planning note, whose shape drops the
      * delegate-side predicate. Such a handle may serve a cache hit (the slice bytes are correct)

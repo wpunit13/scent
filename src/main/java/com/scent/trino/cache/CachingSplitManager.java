@@ -35,7 +35,7 @@ public final class CachingSplitManager implements ConnectorSplitManager {
             Constraint constraint) {
         if (table instanceof CachingTableHandle caching && isCacheable(caching)) {
             log.debug("[SCENT SPI] getSplits wrapping splits for {}", caching);
-            CacheKey cacheKey = CacheKey.of(caching.getSchemaTableName(), caching.getPartitionDomain());
+            CacheKey cacheKey = CacheKey.of(caching.getSchemaTableName(), CacheKey.nameKeyed(caching.getPartitionDomain(), caching.getColumnHandles()));
             return new CachingSplitSource(
                     delegate.getSplits(transaction, session, caching.getDelegateHandle(), columns, constraint),
                     split -> new CachingSplit(

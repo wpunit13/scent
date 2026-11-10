@@ -56,7 +56,7 @@ public final class PlanningNotes {
 
     /** Notes are files on disk; reflection/serialization is restricted to the classes these prefixes name. */
     private static final List<String> ALLOWED_NAMES = List.of(
-            "com.scent.trino.cache.", "io.trino.plugin.jdbc.");
+            "com.scent.trino.cache.", "io.trino.plugin.jdbc.", "io.trino.plugin.bigquery.");
 
     private record TableNoteJson(
             HandleRef handle,
@@ -172,6 +172,10 @@ public final class PlanningNotes {
         if (columns == null) {
             return Optional.empty();
         }
+        Optional<ConnectorTableHandle> handle = readHandle(value.handle(), ConnectorTableHandle.class);
+        if (handle.isEmpty()) {
+            return Optional.empty();
+        }
         ConnectorTableSchema schema = null;
         if (value.schema() != null && typeManager != null) {
             try {
@@ -182,7 +186,7 @@ public final class PlanningNotes {
             }
         }
         return Optional.of(new TableMetadata(
-                readHandle(value.handle(), ConnectorTableHandle.class),
+                handle.get(),
                 columns,
                 value.columnTypes(),
                 schema,
@@ -208,7 +212,8 @@ public final class PlanningNotes {
         if (note.isEmpty() || note.get().filteredHandle() == null) {
             return Optional.empty();
         }
-        return Optional.of(new SliceNote(readHandle(note.get().filteredHandle(), ConnectorTableHandle.class)));
+        return readHandle(note.get().filteredHandle(), ConnectorTableHandle.class)
+                .map(SliceNote::new);
     }
 
     private Path tableNotePath(SchemaTableName table) {
@@ -237,14 +242,25 @@ public final class PlanningNotes {
     }
 
     private void writeNote(Path path, Object note) {
+        Path temp = path.resolveSibling(path.getFileName() + ".tmp");
         try {
             Files.createDirectories(path.getParent());
-            Path temp = path.resolveSibling(path.getFileName() + ".tmp");
             mapper.writeValue(temp.toFile(), note);
-            Files.move(temp, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            try {
+                Files.move(temp, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            }
+            catch (java.nio.file.AtomicMoveNotSupportedException e) {
+                Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING);
+            }
         }
         catch (IOException | RuntimeException e) {
             log.warn("[SCENT] failed to write planning note {}: {}", path, e.toString());
+            try {
+                Files.deleteIfExists(temp);
+            }
+            catch (IOException cleanup) {
+                log.debug("[SCENT] failed to clean up temporary note {}: {}", temp, e.toString());
+            }
         }
     }
 
@@ -325,25 +341,22 @@ public final class PlanningNotes {
         return refs;
     }
 
-    private <T> T readHandle(HandleRef ref, Class<T> type) {
-        if (ref == null) {
-            return null;
+    private <T> Optional<T> readHandle(HandleRef ref, Class<T> type) {
+        // The type name comes from a file on disk, so it is checked against the allowlist
+        // before any class is loaded; anything not allowlisted reads as absent.
+        if (ref == null || ref.type() == null || ALLOWED_NAMES.stream().noneMatch(ref.type()::startsWith)) {
+            return Optional.empty();
         }
         try {
-            // The type name comes from a file on disk, so it may only name allowlisted handle
-            // classes; anything else is treated as a corrupt note rather than instantiated.
-            Class<?> named = Class.forName(ref.type());
-            if (ALLOWED_NAMES.stream().noneMatch(named.getName()::startsWith)) {
-                throw new IllegalArgumentException("handle class not allowlisted: " + ref.type());
-            }
             if (JDBC_TABLE_HANDLE.equals(ref.type())) {
-                return type.cast(jdbcTableHandleFromNote(ref.json()));
+                return Optional.of(type.cast(jdbcTableHandleFromNote(ref.json())));
             }
-            return type.cast(mapper.readValue(ref.json(), named.asSubclass(type)));
+            Class<?> named = Class.forName(ref.type());
+            return Optional.of(type.cast(mapper.readValue(ref.json(), named.asSubclass(type))));
         }
         catch (Exception e) {
             log.debug("[SCENT] failed to read planning-note object {}: {}", ref.type(), e.toString());
-            return null;
+            return Optional.empty();
         }
     }
 
@@ -370,13 +383,13 @@ public final class PlanningNotes {
             return null;
         }
         Map<String, ColumnHandle> columns = new LinkedHashMap<>();
-        refs.forEach((name, ref) -> {
-            ColumnHandle column = readHandle(ref, ColumnHandle.class);
-            if (column == null) {
-                throw new IllegalArgumentException("unreadable column " + name);
+        for (Map.Entry<String, HandleRef> entry : refs.entrySet()) {
+            Optional<ColumnHandle> column = readHandle(entry.getValue(), ColumnHandle.class);
+            if (column.isEmpty()) {
+                return null;
             }
-            columns.put(name, column);
-        });
+            columns.put(entry.getKey(), column.get());
+        }
         return columns;
     }
 }
