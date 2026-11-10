@@ -39,27 +39,22 @@ public final class TableMetadataCache {
      * Null handle, columns, columnTypes, or schema keep the previously learned value for that
      * field; the refresh timestamp always moves. getColumnHandles passes all three, getTableHandle
      * only the handle. viaDelegate marks an entry learned straight from the delegate, which makes
-     * the delegate provably reachable in that cycle. Returns true when a stored VALUE changed (new
-     * entry or a differing field), which is the signal to persist the table note.
+     * the delegate provably reachable in that cycle. Callers rewind the planning note on EVERY
+     * delegate refresh — the note's note timestamp means "when the delegate last confirmed this
+     * metadata", not "when the values last changed", so a stable table still keeps its note fresh.
      */
-    public boolean put(SchemaTableName table, ConnectorTableHandle handle, Map<String, ColumnHandle> columns, Map<String, String> columnTypes, boolean viaDelegate) {
-        return putEntry(table, new Entry(handle, copy(columns), copy(columnTypes), null, viaDelegate, System.nanoTime()));
+    public void put(SchemaTableName table, ConnectorTableHandle handle, Map<String, ColumnHandle> columns, Map<String, String> columnTypes, boolean viaDelegate) {
+        putEntry(table, new Entry(handle, copy(columns), copy(columnTypes), null, viaDelegate, System.nanoTime()));
     }
 
-    public boolean putSchema(SchemaTableName table, ConnectorTableSchema schema, boolean viaDelegate) {
-        return putEntry(table, new Entry(null, null, null, Objects.requireNonNull(schema, "schema is null"), viaDelegate, System.nanoTime()));
+    public void putSchema(SchemaTableName table, ConnectorTableSchema schema, boolean viaDelegate) {
+        putEntry(table, new Entry(null, null, null, Objects.requireNonNull(schema, "schema is null"), viaDelegate, System.nanoTime()));
     }
 
-    private boolean putEntry(SchemaTableName table, Entry update) {
-        boolean[] changed = {false};
+    private void putEntry(SchemaTableName table, Entry update) {
         byTable.compute(
                 Objects.requireNonNull(table, "table is null").toString(),
-                (key, existing) -> {
-                    Entry merged = existing == null ? update : merge(existing, update);
-                    changed[0] = existing == null || valueChanged(existing, merged);
-                    return merged;
-                });
-        return changed[0];
+                (key, existing) -> existing == null ? update : merge(existing, update));
     }
 
     private static Entry merge(Entry existing, Entry update) {
@@ -70,24 +65,6 @@ public final class TableMetadataCache {
                 update.schema != null ? update.schema : existing.schema,
                 update.viaDelegate,
                 update.refreshedAtNanos);
-    }
-
-    private static boolean valueChanged(Entry before, Entry after) {
-        return !Objects.equals(before.handle, after.handle)
-                || !Objects.equals(before.columns, after.columns)
-                || !Objects.equals(before.columnTypes, after.columnTypes)
-                || !schemaEquals(before.schema, after.schema);
-    }
-
-    /** ConnectorTableSchema has no equals; its identity is the table plus its columns. */
-    private static boolean schemaEquals(ConnectorTableSchema before, ConnectorTableSchema after) {
-        if (before == after) {
-            return true;
-        }
-        if (before == null || after == null) {
-            return false;
-        }
-        return before.getTable().equals(after.getTable()) && before.getColumns().equals(after.getColumns());
     }
 
     public Optional<ConnectorTableHandle> getHandle(SchemaTableName table) {

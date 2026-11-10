@@ -714,6 +714,32 @@ class CachingMetadataTest {
         assertSame(outage, thrown);
     }
 
+    @Test
+    void unchangedDelegateRefreshKeepsTheNoteCurrent(@TempDir Path notesDir) throws Exception {
+        // The old note-write trigger ("a stored value changed") froze the note timestamp while
+        // the delegate kept confirming identical metadata; a later restart then expired a note
+        // the delegate had in fact just refreshed. The note timestamp must track the delegate.
+        PlanningNotes notes = new PlanningNotes(notesDir, FixedTypeManager.INSTANCE);
+        SchemaTableName target = new SchemaTableName("schema", "table");
+        stub.columns = Map.of(PARTITION_COLUMN, partitionHandle, "other", otherHandle);
+
+        ConnectorMetadata healthy = healthyWrapper(notes, ZERO);
+        CachingTableHandle first = tableHandle(healthy);
+        healthy.getColumnHandles(null, first);
+        long firstNoteTimestamp = notes.readTable(target).orElseThrow().refreshedAtEpochMillis();
+
+        // A second refresh cycle where the delegate answers exactly the same metadata.
+        Thread.sleep(3); // distinguish the second note write from the first on coarse clock granularity
+        CachingTableHandle second = tableHandle(healthy);
+        healthy.getColumnHandles(null, second);
+        assertEquals(2, stub.tableHandleCalls);
+        assertEquals(2, stub.columnHandlesCalls);
+
+        long secondNoteTimestamp = notes.readTable(target).orElseThrow().refreshedAtEpochMillis();
+        assertTrue(secondNoteTimestamp > firstNoteTimestamp,
+                "a delegate confirmation with unchanged values must still move the note's timestamp");
+    }
+
     private ConnectorMetadata healthyWrapper(PlanningNotes notes, Duration refresh) {
         stub.clearFailures();
         return CachingMetadata.wrap(stub, Map.of(TABLE_ID, List.of(PARTITION_COLUMN)), true, new TableMetadataCache(), notes, Map.of(TABLE_ID, refresh));
