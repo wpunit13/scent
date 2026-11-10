@@ -176,11 +176,11 @@ connection-password=secure_password
 ```
 ### Trino Pages To Parquet Storage
 
-When `cache.root` is set, each completed in-memory slice is also written as a typed Parquet file under that directory. SCENT currently serves cache hits from each worker's in-memory cache; it does not load these Parquet files back on a cache miss.
+When `cache.root` is set, each completed slice is written as a typed Parquet file under that directory, and cache hits are served by reading that file back. The disk is the only cache tier (ADR-014): there is no in-memory page cache, so a cache hit always reads Parquet from `cache.root` and rebuilds pages.
 
 Every Trino node that should access the same Parquet files must mount the same shared filesystem at that directory. The e2e Compose deployment bind-mounts the host directory `e2e/cache` at `/tmp/scent-cache` on the coordinator and worker containers, so the Parquet files are directly visible in the project directory. For workers on multiple hosts, mount a shared filesystem (such as NFS) at the configured path on every host; a local host directory is not shared across hosts.
 
-If `cache.root` is unset or invalid, SCENT keeps the in-memory cache enabled and skips Parquet storage.
+If `cache.root` is unset or invalid, SCENT does no caching: every read passes through to the delegate.
 
 ### Version lock
 
