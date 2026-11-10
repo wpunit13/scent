@@ -63,7 +63,7 @@ Queue order: T18 (per-split cache keys, next) → T11 (bucket subdivision) → T
 - [ ] T11: Bucket subdivision of coarse JDBC splits (ADR-012)
 - [ ] T12: Affinity via `getAffinityKey` (ADR-005)
 - [ ] T13: SIEVE eviction (ADR-010)
-- [ ] T14: Single-flight populate (D3) — lock-file design agreed (empty = claimable, timestamp = heartbeat, takeover by atomic rename, losers continue uncached). Full flow and edge cases in plan.md.
+- [ ] T14: Single-flight populate (D3) — lock-file design agreed (empty = claimable, timestamp = heartbeat, takeover by atomic rename, losers continue uncached). Also collapse concurrent note rewrites (carry-over; see plan.md). Full flow and edge cases in plan.md.
 - [ ] T15: Disk-only store — FileSliceStore replaces the memory tier; populate streams to Parquet (ADR-014)
 - [x] T16: Per-table partition columns (CRITICAL — supersedes README out-of-scope entry; ADR-013)
 

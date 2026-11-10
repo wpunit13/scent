@@ -290,6 +290,7 @@ Lock scope and get a measurable yardstick before building more.
 - Acceptance: exactly one completed slice per key per cold burst; on a single worker, exactly one delegate source read per cold burst (losers' duplicate uncached reads are accepted and write nothing); a claimer that dies before writing its timestamp is taken over by the next miss after the empty-lock grace; a live owner that dies mid-populate is taken over within one heartbeat window; no timers exist outside the request path; parallel populates of one key never produce a partial or wrong file.
 - Verification: unit test with concurrent threads on one key (exactly one completed slice; losers serve uncached); instrumented delegate-read count = 1 on a single worker; takeover tests for all four decision rows (young-empty backoff, old-empty takeover, fresh-heartbeat lose, stale-heartbeat takeover); shared-mode lock behavior exercised when shared mode lands.
 - Dependencies: Task 6.
+- **Carry-over from review (2026-11-10):** when single-flight lands, also collapse concurrent note rewrites. N concurrent misses of the same expired table currently serialize under `PlanningNotes`' `lock` and each rewrites the table note (idempotent, N writes). The slice note still uses on-change semantics while the table note uses on-refresh, and its `refreshedAtEpochMillis` is never read. Align or drop in the same pass.
 
 **Task 15: Disk-only store — FileSliceStore replaces the memory tier (ADR-014).**
 - Decision: the user confirmed the memory tier is not viable in a Trino worker (long-lived heap pages are
