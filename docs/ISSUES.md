@@ -307,6 +307,57 @@ file-system cache) is disk-based for the same reason.
 - In-memory FIFO/SIEVE eviction (T13) becomes disk-file eviction over the cache directory.
 - Restart survival is unchanged: the disk was already the source of truth.
 
+### ADR-015 — Per-split cache keys (multi-split delegates, restores ADR-008 scope)
+
+**Status:** accepted (next work package, 2026-11-10)
+
+**Context:** ADR-004 originally specified the key as `[table, sliceId, bucket, version]`, but the
+implementation shipped `[table, partition, version]` — the `bucket` dimension was dropped. That key
+assumes one delegate split per partition (true for JDBC, ADR-012). Multi-split delegates (BigQuery,
+Snowflake) emit N splits for one partition, all sharing one key: on a hit every split returns the full
+slice (N× duplicate rows), on a miss every split writes the same file (last-writer-wins clobber). This
+narrowed the original "everything except table formats" scope (ADR-008) to "JDBC single-split"; finding
+#15 gated BigQuery as a stopgap. This ADR removes the gate by restoring the missing key dimension.
+
+**Decision:** The cache key becomes `(table, partition, split, version)`. Each delegate split is cached
+as its own unit (ADR-012 "cache each delegate split as its own unit"). For single-split delegates (JDBC)
+the split component is empty, preserving the current layout and behavior exactly. This also unblocks T11
+bucket subdivision: the same key dimension carries a bucket id instead of a delegate-split id.
+
+**Split identity.** The SPI gives `ConnectorSplit` no generic identity — only `equals`/`hashCode`/
+`toString`/`getAddresses`. The split component is therefore derived from `split.toString()`:
+
+- Deterministic for the in-scope delegates: `BigQuerySplit` is a Java record, so its `toString` is a
+  pure function of fields; `JdbcSplit` is single-split (identity is trivial).
+- Injective for BigQuery: the record `toString` includes the unique `streamName` field, so distinct
+  streams → distinct strings.
+- Stable within a freshness window: the split set is a function of the data, which ADR-007 (version/TTL)
+  holds constant within the window; re-sharding is a data change and rotates the key through the same
+  version/TTL path.
+
+Because `toString()` is long (stream names, schema, column list), the split component is stored as a
+**SHA-256 hex digest** of `split.toString()` (64 hex chars), not the raw string. This keeps filenames
+bounded and is collision-resistant. `String.hashCode()` (32-bit) is the simpler fallback but is rejected:
+at a few hundred splits the birthday bound makes collisions plausible, and a collision silently aliases
+two slices.
+
+**Known limitation (same class as #8).** `toString()` is not *guaranteed* injective or deterministic for
+an arbitrary connector split. A connector whose split `toString` is non-deterministic would rotate its key
+every query (permanent miss); one whose `toString` collides for distinct splits would alias slices.
+Mitigation is deferred: the in-scope multi-split delegate (BigQuery, record + unique stream name) is safe
+by construction; a connector that violates the assumption needs the same "derive a stable identity"
+treatment #8 applied to columns.
+
+**Consequences:**
+- `CacheKey` gains a `split` field (String, empty for single-split) between `partition` and `version`;
+  `equals`/`hashCode` and the path segment include it.
+- `fileFor` becomes `root/table/partition/version-<split>.parquet`; an empty split yields `version.parquet`
+  (unchanged for JDBC). `PlanningNotes.sliceNotePath` mirrors it.
+- `CachingSplitManager` and `OutageSafeSplitManager` compute a per-split key (digest of the delegate
+  split's `toString`); `CachingPageSourceProvider` is unchanged (it already serves per-split).
+- The BigQuery gate in `DelegateConnectorResolver` is removed.
+- Populate/hit logic is unchanged; only the key (and therefore the file identity) differs.
+
 ---
 
 ## Design: the raw-slice problem (C1/C2/C3)
@@ -458,3 +509,4 @@ Cold slice + concurrent queries = thundering herd. Two flavors:
 | 2026-10-11 | T11 subdivision: range buckets are the primary mechanism (source-prunable columns); size-chunking at the per-slice cap is the fallback for tables with no prunable column; chunk or bucket count bounded per slice | Range buckets give parallelism, source pruning, and per-bucket versioning; chunking covers the tables range buckets cannot serve |
 | 2026-10-04 | Column layout fixed by sorted column names (`cachedChannelOrder`) | Map iteration order is not deterministic across transactions; sorted keys keep the cached page layout identical for hits and populate reads |
 | 2026-10-04 | applyFilter bails to uncached when the delegate partially applied the partition constraint | Cached slices assume the delegate applied the partition predicate fully; merging delegate leftovers deferred |
+| 2026-11-10 | ADR-015: cache key gains a per-split dimension (`split` = SHA-256 of delegate split `toString`); restores ADR-004's `[table, sliceId, bucket, version]` and ADR-008's non-table-format scope; removes the BigQuery gate | Multi-split delegates shared one partition key → duplicate rows on hit, clobber on miss; BigQuery record `toString` is deterministic and injective via `streamName`; SHA-256 keeps filenames bounded |

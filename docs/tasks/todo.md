@@ -1,6 +1,6 @@
 # SCENT implementation todo
 
-Queue order: T17 (durable planning notes, next) → Phase 5 (freshness, reshaped to cache-first) → Phase 6.
+Queue order: T18 (per-split cache keys, next) → T11 (bucket subdivision) → T12–T14 (Phase 6 hardening).
 
 ## Phase 1 — Baseline & measurement
 - [x] T1: Success criteria + benchmark harness
@@ -59,6 +59,7 @@ Queue order: T17 (durable planning notes, next) → Phase 5 (freshness, reshaped
 > the engine's typed Jackson module fail every TaskUpdateRequest with conflicting-creator errors.
 
 ## Phase 6 — Local-mode production hardening
+- [ ] T18: Per-split cache keys for multi-split delegates (ADR-015) — restores ADR-004's `bucket` dimension and ADR-008 scope; prerequisite for T11
 - [ ] T11: Bucket subdivision of coarse JDBC splits (ADR-012)
 - [ ] T12: Affinity via `getAffinityKey` (ADR-005)
 - [ ] T13: SIEVE eviction (ADR-010)

@@ -197,6 +197,31 @@ Lock scope and get a measurable yardstick before building more.
 
 ### Phase 6 — Local-mode production hardening
 
+**Task 18: Per-split cache keys for multi-split delegates (ADR-015) — NEXT.**
+- Description: restore the key dimension ADR-004 specified but the implementation dropped. The key becomes
+  `(table, partition, split, version)`; each delegate split is cached as its own unit. The split identity is
+  a SHA-256 hex digest of the delegate split's `toString()` (empty for single-split delegates, preserving
+  today's JDBC layout exactly).
+- Why: with one key per partition, multi-split delegates (BigQuery) return the full slice on every hit
+  (N× duplicate rows) and clobber the file on miss. Gating BigQuery (#15) was a stopgap; this removes the
+  gate. It is also the prerequisite for T11: bucket subdivision reuses the same key dimension (a bucket id
+  instead of a delegate-split id).
+- Split identity derivation: `split.toString()` is deterministic and injective for the in-scope delegates
+  (`BigQuerySplit` is a Java record with a unique `streamName`; `JdbcSplit` is single-split). SHA-256 keeps
+  the filename bounded; `String.hashCode()` (32-bit) is rejected for collision risk. Known limitation (same
+  class as #8): `toString()` is not guaranteed injective/deterministic for an arbitrary connector; the
+  supported delegates are safe by construction, and a violating connector needs the same stable-identity
+  treatment #8 applied to columns.
+- Implementation: add `split` to `CacheKey` (field, `equals`/`hashCode`, `pathSegment`); `fileFor` becomes
+  `root/table/partition/version-<split>.parquet` (empty split → `version.parquet`); `PlanningNotes.sliceNotePath`
+  mirrors it; `CachingSplitManager` and `OutageSafeSplitManager` compute a per-split key (digest of the
+  delegate split's `toString`); remove the `MULTI_SPLIT_DELEGATES` gate in `DelegateConnectorResolver`.
+- Acceptance: a BigQuery multi-split scan populates N distinct slices and each hit serves its own slice with
+  no duplicate rows; a JDBC scan still produces exactly the current layout (`version.parquet`).
+- Verification: unit test for per-split key derivation and SHA-256 rendering; split-manager test asserting
+  N distinct keys for N delegate splits; e2e with a multi-split delegate (or a mocked multi-split split source).
+- Dependencies: none (the name-keyed CacheKey from #8 is already landed).
+
 **Task 11: Bucket subdivision of coarse JDBC splits (ADR-012).**
 - Description: query `min/max` of a range column per slice; emit N range-domain splits when the row estimate
   justifies it. Cache unit becomes `(slice, bucket)`.

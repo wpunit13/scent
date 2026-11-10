@@ -77,7 +77,7 @@ Key components:
 Non-lakehouse sources (e.g., PostgreSQL) lack native partition metadata. TRACE bridges this gap declaratively at the catalog level: the catalog config names each cacheable table and its partition columns.
 
 * **Per-table grain (ADR-013):** `cache.partition-column.<schema>.<table>` is a JSON array naming the slice grain, e.g. `["region"]` or `["day", "region"]`. Tables without an entry are never cached for data.
-* **Slice identity:** the conjunction of the grain-column domains present in a query's filter (partial grains produce coarser slices — ADR-013). The identity is carried by `CacheKey(table, partition, version)`, which also renders the on-disk directory path deterministically (ADR-006).
+* **Slice identity:** the conjunction of the grain-column domains present in a query's filter (partial grains produce coarser slices — ADR-013). The identity is carried by `CacheKey(table, partition, split, version)`, which also renders the on-disk directory path deterministically (ADR-006). The `split` dimension is empty for single-split delegates (JDBC) and holds a SHA-256 digest of the delegate split for multi-split delegates (ADR-015).
 * **Sub-bucketing (planned, T11):** subdividing coarse JDBC splits into per-range buckets for parallelism. Not yet implemented; the key layout reserves room for it.
 
 ### 3.2 Cache-First Planning (TTL-Governed)
@@ -99,6 +99,8 @@ flowchart TD
 * **Trust flag:** a handle rebuilt from a note has lost the delegate-side predicate. It may serve a cache hit but never drives a delegate read presented as filtered (see §3.4). It is upgraded through the delegate whenever the same cycle proves the delegate reachable.
 
 ### 3.3 Data Path: Slice Lookup, Populate, Single-Flight Publish
+
+*Single-flight populate (T14) is planned, not implemented.* The current data path does per-query widen-on-miss with atomic-rename publish and no lock file; a burst of cold misses re-reads the delegate, which decision 8 accepts. The lock flow below is the target design.
 The query's slice identity is looked up directly on the shared cache directory — no registry: the lookup is a filesystem stat on the path derived from the `CacheKey`.
 
 ```mermaid
@@ -272,7 +274,7 @@ The phased roadmap, task list, acceptance criteria, and design decisions live in
 | 4. Source-outage resilience | T8 | done |
 | 4.5 Durable planning notes | T17 | done |
 | 5. Freshness | T9 done; T10 next | in progress |
-| 6. Production hardening | T11-T16 (T15, T16 done) | pending |
+| 6. Production hardening | T18, T11-T16 (T15, T16 done) | pending (T18 next) |
 | Later: storage evolution | parquet-avro → trino-parquet migration note | deferred |
 
 Design decisions with rationale (accelerator-not-replacement, no remote metadata store, lock-file single-flight, storm handling) are recorded in plan.md's Decisions section and §3.6 of this document.
