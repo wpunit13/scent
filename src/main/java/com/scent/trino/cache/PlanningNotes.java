@@ -275,6 +275,15 @@ public final class PlanningNotes {
      * cache hit.
      */
     private static final String JDBC_TABLE_HANDLE = "io.trino.plugin.jdbc.JdbcTableHandle";
+    private static final String JDBC_NAMED_RELATION_HANDLE = "io.trino.plugin.jdbc.JdbcNamedRelationHandle";
+    private static final String REMOTE_TABLE_NAME = "io.trino.plugin.jdbc.RemoteTableName";
+
+    private static final String KEY_SCHEMA = "schema";
+    private static final String KEY_TABLE = "table";
+    private static final String KEY_REMOTE_CATALOG = "remoteCatalog";
+    private static final String KEY_REMOTE_SCHEMA = "remoteSchema";
+    private static final String KEY_REMOTE_TABLE = "remoteTable";
+    private static final String KEY_AUTHORIZATION = "authorization";
 
     private HandleRef envelope(Object value, HandleRef fallback) {
         if (value == null) {
@@ -299,7 +308,7 @@ public final class PlanningNotes {
         // asPlainTable rejects it, but the relation itself stays a named relation carrying the
         // table identity the note needs.
         Object relation = type.getMethod("getRelationHandle").invoke(handle);
-        if (!"io.trino.plugin.jdbc.JdbcNamedRelationHandle".equals(relation.getClass().getName())) {
+        if (!JDBC_NAMED_RELATION_HANDLE.equals(relation.getClass().getName())) {
             throw new IllegalStateException("unsupported relation " + relation.getClass().getName());
         }
         SchemaTableName table = (SchemaTableName) relation.getClass().getMethod("getSchemaTableName").invoke(relation);
@@ -307,12 +316,12 @@ public final class PlanningNotes {
         @SuppressWarnings("unchecked")
         Optional<String> authorization = (Optional<String>) type.getMethod("getAuthorization").invoke(handle);
         Map<String, Object> shape = new LinkedHashMap<>();
-        shape.put("schema", table.getSchemaName());
-        shape.put("table", table.getTableName());
-        shape.put("remoteCatalog", remoteCatalogOf(remoteTable));
-        shape.put("remoteSchema", remoteSchemaOf(remoteTable));
-        shape.put("remoteTable", remoteNameOf(remoteTable));
-        shape.put("authorization", authorization == null ? null : authorization.orElse(null));
+        shape.put(KEY_SCHEMA, table.getSchemaName());
+        shape.put(KEY_TABLE, table.getTableName());
+        shape.put(KEY_REMOTE_CATALOG, remoteCatalogOf(remoteTable));
+        shape.put(KEY_REMOTE_SCHEMA, remoteSchemaOf(remoteTable));
+        shape.put(KEY_REMOTE_TABLE, remoteNameOf(remoteTable));
+        shape.put(KEY_AUTHORIZATION, authorization == null ? null : authorization.orElse(null));
         return new HandleRef(JDBC_TABLE_HANDLE, mapper.writeValueAsString(shape));
     }
 
@@ -362,16 +371,16 @@ public final class PlanningNotes {
 
     private ConnectorTableHandle jdbcTableHandleFromNote(String json) throws Exception {
         JsonNode node = mapper.readTree(json);
-        SchemaTableName table = new SchemaTableName(node.path("schema").asText(), node.path("table").asText());
-        Class<?> remoteType = Class.forName("io.trino.plugin.jdbc.RemoteTableName");
+        SchemaTableName table = new SchemaTableName(node.path(KEY_SCHEMA).asText(), node.path(KEY_TABLE).asText());
+        Class<?> remoteType = Class.forName(REMOTE_TABLE_NAME);
         Constructor<?> remoteConstructor = remoteType.getConstructor(Optional.class, Optional.class, String.class);
         Object remoteTable = remoteConstructor.newInstance(
-                optionalOf(node.path("remoteCatalog").asText(null)),
-                optionalOf(node.path("remoteSchema").asText(null)),
-                node.path("remoteTable").asText());
+                optionalOf(node.path(KEY_REMOTE_CATALOG).asText(null)),
+                optionalOf(node.path(KEY_REMOTE_SCHEMA).asText(null)),
+                node.path(KEY_REMOTE_TABLE).asText());
         Class<?> handleType = Class.forName(JDBC_TABLE_HANDLE);
         Constructor<?> constructor = handleType.getConstructor(SchemaTableName.class, remoteType, Optional.class);
-        return (ConnectorTableHandle) constructor.newInstance(table, remoteTable, optionalOf(node.path("authorization").asText(null)));
+        return (ConnectorTableHandle) constructor.newInstance(table, remoteTable, optionalOf(node.path(KEY_AUTHORIZATION).asText(null)));
     }
 
     private static Optional<String> optionalOf(String value) {
