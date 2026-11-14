@@ -14,6 +14,8 @@ import io.trino.spi.connector.SchemaTableName;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Proxy;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static io.trino.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
@@ -26,6 +28,7 @@ class CachingConnectorTest {
 
     private static final class StubMetadata implements ConnectorMetadata {
         final ConnectorTableHandle handle = new ConnectorTableHandle() {};
+        RuntimeException tableHandleFailure;
 
         @Override
         public ConnectorTableHandle getTableHandle(
@@ -33,6 +36,9 @@ class CachingConnectorTest {
                 SchemaTableName tableName,
                 Optional<ConnectorTableVersion> startVersion,
                 Optional<ConnectorTableVersion> endVersion) {
+            if (tableHandleFailure != null) {
+                throw tableHandleFailure;
+            }
             return handle;
         }
     }
@@ -71,7 +77,7 @@ class CachingConnectorTest {
     @Test
     void forwardsShutdownToDelegate() {
         StubConnector stub = new StubConnector();
-        Connector connector = CachingConnector.wrap(stub, "part", new InMemorySliceStore(1024 * 1024, null, null));
+        Connector connector = CachingConnector.wrap(stub, Map.of("s.t", List.of("part")), new FileSliceStore(1024 * 1024, null, null, Map.of()), new TableMetadataCache(), new PlanningNotes(null, null), Map.of());
 
         connector.shutdown();
 
@@ -81,9 +87,9 @@ class CachingConnectorTest {
     @Test
     void wrapsSpiSubObjectsAndForwardsCalls() {
         StubConnector stub = new StubConnector();
-        Connector connector = CachingConnector.wrap(stub, "part", new InMemorySliceStore(1024 * 1024, null, null));
+        Connector connector = CachingConnector.wrap(stub, Map.of("s.t", List.of("part")), new FileSliceStore(1024 * 1024, null, null, Map.of()), new TableMetadataCache(), new PlanningNotes(null, null), Map.of());
 
-        assertInstanceOf(CachingSplitManager.class, connector.getSplitManager());
+        assertInstanceOf(OutageSafeSplitManager.class, connector.getSplitManager());
         ConnectorPageSourceProviderFactory wrappedFactory = (ConnectorPageSourceProviderFactory) connector.getPageSourceProviderFactory();
         assertInstanceOf(CachingPageSourceProvider.class, wrappedFactory.createPageSourceProvider());
 
@@ -99,8 +105,24 @@ class CachingConnectorTest {
         StubConnector stub = new StubConnector();
         TrinoException boom = new TrinoException(GENERIC_INTERNAL_ERROR, "boom");
         stub.failure = boom;
-        Connector connector = CachingConnector.wrap(stub, "part", new InMemorySliceStore(1024 * 1024, null, null));
+        Connector connector = CachingConnector.wrap(stub, Map.of("s.t", List.of("part")), new FileSliceStore(1024 * 1024, null, null, Map.of()), new TableMetadataCache(), new PlanningNotes(null, null), Map.of());
 
         assertSame(boom, assertThrows(TrinoException.class, connector::shutdown));
+    }
+
+    @Test
+    void metadataCacheIsSharedAcrossTransactions() {
+        StubConnector stub = new StubConnector();
+        Connector connector = CachingConnector.wrap(stub, Map.of("s.t", List.of("part")), new FileSliceStore(1024 * 1024, null, null, Map.of()), new TableMetadataCache(), new PlanningNotes(null, null), Map.of("s.t", io.airlift.units.Duration.valueOf("1h")));
+
+        connector.getMetadata(null, null).getTableHandle(null, new SchemaTableName("s", "t"), Optional.empty(), Optional.empty());
+
+        stub.metadata.tableHandleFailure = new RuntimeException("source down");
+        // A fresh planning entry is served from the connector-lifetime cache without the delegate.
+        ConnectorTableHandle served = connector.getMetadata(null, null) // new transaction, same connector-lifetime cache
+                .getTableHandle(null, new SchemaTableName("s", "t"), Optional.empty(), Optional.empty());
+
+        assertInstanceOf(CachingTableHandle.class, served);
+        assertSame(stub.metadata.handle, ((CachingTableHandle) served).getDelegateHandle());
     }
 }

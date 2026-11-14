@@ -21,7 +21,6 @@
         <lombok.version>1.18.48</lombok.version>
         <maven.compiler.release>25</maven.compiler.release>
         <trino.version>483</trino.version>
-        <hadoop.version>3.5.0</hadoop.version>
     </properties>
 
     <dependencyManagement>
@@ -66,19 +65,32 @@
         </dependency>
 
         <dependency>
-            <groupId>org.apache.parquet</groupId>
-            <artifactId>parquet-avro</artifactId>
+            <groupId>io.trino</groupId>
+            <artifactId>trino-parquet</artifactId>
+            <version>${trino.version}</version>
+        </dependency>
+
+        <!-- Per-table partition-column config values are JSON arrays; parsed in the factory.
+             Version matches the jackson already bundled via avro. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.22.1</version>
+        </dependency>
+
+        <!-- Planning notes serialize delegate handles whose fields use Optional and guava
+             collections; the SPI classes are annotated for Jackson and these modules make the
+             fields round-trip. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jdk8</artifactId>
+            <version>2.22.1</version>
         </dependency>
 
         <dependency>
-            <groupId>org.apache.parquet</groupId>
-            <artifactId>parquet-hadoop</artifactId>
-        </dependency>
-
-        <dependency>
-            <groupId>org.apache.hadoop</groupId>
-            <artifactId>hadoop-common</artifactId>
-            <version>${hadoop.version}</version>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-guava</artifactId>
+            <version>2.22.1</version>
         </dependency>
 
         <dependency>
@@ -129,6 +141,15 @@
             <artifactId>junit-jupiter</artifactId>
             <scope>test</scope>
         </dependency>
+
+        <!-- Test only: the planning-note round trip must survive the real delegate handle
+             classes, not just our own. -->
+        <dependency>
+            <groupId>io.trino</groupId>
+            <artifactId>trino-base-jdbc</artifactId>
+            <version>${trino.version}</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -163,6 +184,15 @@
                             <version>${lombok.version}</version>
                         </path>
                     </annotationProcessorPaths>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+                <configuration>
+                    <argLine>--add-modules=jdk.incubator.vector</argLine>
                 </configuration>
             </plugin>
 

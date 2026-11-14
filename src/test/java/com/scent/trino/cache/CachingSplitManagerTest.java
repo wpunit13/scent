@@ -107,8 +107,8 @@ class CachingSplitManagerTest {
         assertEquals(1, split.cachedChannelIndex(columnB));
         assertEquals(Map.of("a", "bigint", "b", "varchar"), split.getColumnTypes());
         assertEquals(List.of("bigint", "varchar"), split.cachedChannelTypes());
-        assertTrue(split.getSliceKey().contains("schema.table"));
-        assertTrue(split.getSliceKey().contains("|"));
+        assertEquals(new SchemaTableName("schema", "table"), split.getCacheKey().getTable());
+        assertEquals("none", split.getCacheKey().getVersion());
         assertFalse(result.isFinished());
         result.close();
         assertTrue(source.closed);

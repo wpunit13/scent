@@ -4,9 +4,13 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
-# JDK 25 is required. Honour an explicit JAVA_HOME, else discover one, then verify.
-if [ -z "${JAVA_HOME:-}" ]; then
+# Pick a JDK 25: a valid JAVA_HOME wins, else macOS discovery, else fail.
+if [ -n "${JAVA_HOME:-}" ] && "$JAVA_HOME/bin/javac" -version 2>&1 | grep -q 'javac 25'; then
+  : # JAVA_HOME already points at a JDK 25
+elif [ -x /usr/libexec/java_home ]; then
   JAVA_HOME="$(/usr/libexec/java_home -v 25 2>/dev/null || true)"
+else
+  JAVA_HOME=""
 fi
 if [ -z "${JAVA_HOME:-}" ] || ! "$JAVA_HOME/bin/javac" -version 2>&1 | grep -q 'javac 25'; then
   echo "error: JDK 25 required; set JAVA_HOME to a JDK 25 install" >&2
@@ -78,7 +82,7 @@ echo "== verification"
 check "passthrough count(*)=300"  300     "$(scalar 'SELECT count(*) FROM scent.public.metrics')"
 
 check "populate us-west partition" 100 "$(scalar "SELECT count(*) FROM scent.public.metrics WHERE region='us-west'")"
-west_parquet_files=$(docker compose exec -T trino-worker sh -c "find /tmp/scent-cache -type f -name '*us-west*.parquet' -print | grep -c . || true" | tr -d '\r')
+west_parquet_files=$(docker compose exec -T trino-worker sh -c "find /tmp/scent-cache -type f -path '*us-west*' -name '*.parquet' -print | grep -c . || true" | tr -d '\r')
 [ "${west_parquet_files:-0}" -ge 1 ] && west_parquet_files=1 || west_parquet_files=0
 check "us-west Parquet slice created" 1 "$west_parquet_files"
 
@@ -132,6 +136,61 @@ check "0-col count(*)=100"        100     "$(scalar "SELECT count(*) FROM scent.
 
 check "no-partition passthrough"  300     "$(scalar 'SELECT count(*) FROM scent.public.metrics')"
 pt=$(docker compose logs trino-coordinator 2>/dev/null | grep -c 'getSplits passthrough'); [ "$pt" -ge 1 ] && pt=1; check "passthrough logged" 1 "$pt"
+
+check "unconfigured table query"  hello    "$(scalar 'SELECT payload FROM scent.public.notes WHERE id=1')"
+notes_files=$(docker compose exec -T trino-worker sh -c "find /tmp/scent-cache -type f -name '*.parquet' -path '*notes*' | grep -c . || true" | tr -d '\r')
+[ "${notes_files:-0}" = 0 ] && notes_uncached=1 || notes_uncached=0
+check "unconfigured table not cached" 1 "$notes_uncached"
+
+echo "== restart survival (ADR-011: persist, do not wipe)"
+before_misses=$(docker compose logs trino-worker 2>/dev/null | grep -c 'cache miss' || true)
+docker compose restart trino-worker > /dev/null 2>&1
+for _ in $(seq 1 40); do
+  if python3 run-query.py "SELECT count(*) FROM scent.public.metrics" >/dev/null 2>&1; then break; fi
+  sleep 5
+done
+check "restart: slice still served" 7425.0 "$(scalar "SELECT sum(value) FROM scent.public.metrics WHERE region='us-east'")"
+after_misses=$(docker compose logs trino-worker 2>/dev/null | grep -c 'cache miss' || true)
+[ "$after_misses" = "$before_misses" ] && no_new=1 || no_new=0
+check "restart: no source read" 1 "$no_new"
+disk_loads=$(docker compose logs trino-worker 2>/dev/null | grep -c 'loaded slice.*from Parquet' || true); [ "$disk_loads" -ge 1 ] && disk_loads=1 || disk_loads=0
+check "restart: slice loaded from disk" 1 "$disk_loads"
+
+echo "== coordinator restart (planning notes must carry metadata across restarts)"
+docker compose restart trino-coordinator > /dev/null 2>&1
+for _ in $(seq 1 60); do
+  if curl -sf http://localhost:8080/v1/info 2>/dev/null | grep -q '"starting":false'; then break; fi
+  sleep 5
+done
+
+echo "== source outage (cache-first: fresh planning entries ride out a stopped source)"
+planning_calls() { docker compose logs trino-coordinator 2>/dev/null | grep -c 'Forwarding ConnectorMetadata.getTableHandle' || true; }
+docker compose stop postgres > /dev/null 2>&1
+calls_before=$(planning_calls)
+check "outage: cached sum served without source" 7425.0 "$(scalar "SELECT sum(value) FROM scent.public.metrics WHERE region='us-east'")"
+calls_after=$(planning_calls)
+[ "$calls_after" = "$calls_before" ] && outage_no_contact=1 || outage_no_contact=0
+check "outage: planning made no delegate call" 1 "$outage_no_contact"
+outage_misses=$(docker compose logs trino-worker 2>/dev/null | grep -c 'cache miss' || true)
+[ "$outage_misses" = "$after_misses" ] && outage_no_new=1 || outage_no_new=0
+check "outage: no new cache miss" 1 "$outage_no_new"
+docker compose start postgres > /dev/null 2>&1
+for _ in $(seq 1 30); do
+  docker compose exec -T postgres psql -U test -d test -c 'SELECT 1' > /dev/null 2>&1 && break
+  sleep 2
+done
+# Entries stay fresh for the refresh window, so the delegate stays untouched until a query
+# lands after expiry. Success means a query that finally forwarded getTableHandle to the
+# delegate: the TTL expired and the live source answered (cache-first, no grace window).
+refresh_ok=0
+for _ in $(seq 1 70); do
+  scalar "SELECT sum(value) FROM scent.public.metrics WHERE region='us-east'" > /dev/null || true
+  calls_now=$(planning_calls)
+  if [ "$calls_now" -gt "$calls_after" ]; then refresh_ok=1; break; fi
+  sleep 5
+done
+check "postgres back: expired entry refreshes from source" 1 "$refresh_ok"
+check "postgres back: cached sum still correct" 7425.0 "$(scalar "SELECT sum(value) FROM scent.public.metrics WHERE region='us-east'")"
 
 echo "== Parquet files in the shared cache mount"
 find ./cache -type f -name '*.parquet' -exec ls -lh {} \;

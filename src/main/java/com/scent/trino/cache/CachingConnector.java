@@ -1,5 +1,7 @@
 package com.scent.trino.cache;
 
+import com.scent.trino.delegate.DelegateConnectorResolver;
+import io.airlift.units.Duration;
 import io.trino.spi.connector.Connector;
 import io.trino.spi.connector.ConnectorMetadata;
 import io.trino.spi.connector.ConnectorPageSourceProvider;
@@ -11,26 +13,46 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 @Slf4j
 public final class CachingConnector implements InvocationHandler {
 
     private final Connector delegate;
-    private final String partitionColumn;
-    private final InMemorySliceStore sliceStore;
+    private final Map<String, List<String>> partitionColumnsByTable;
+    private final FileSliceStore sliceStore;
+    private final TableMetadataCache metadataCache;
+    private final PlanningNotes planningNotes;
+    private final Map<String, Duration> refreshByTable;
 
-    public CachingConnector(Connector delegate, String partitionColumn, InMemorySliceStore sliceStore) {
+    public CachingConnector(
+            Connector delegate,
+            Map<String, List<String>> partitionColumnsByTable,
+            FileSliceStore sliceStore,
+            TableMetadataCache metadataCache,
+            PlanningNotes planningNotes,
+            Map<String, Duration> refreshByTable) {
         this.delegate = Objects.requireNonNull(delegate, "delegate is null");
-        this.partitionColumn = Objects.requireNonNull(partitionColumn, "partitionColumn is null");
+        this.partitionColumnsByTable = Objects.requireNonNull(partitionColumnsByTable, "partitionColumnsByTable is null");
         this.sliceStore = Objects.requireNonNull(sliceStore, "sliceStore is null");
+        this.metadataCache = Objects.requireNonNull(metadataCache, "metadataCache is null");
+        this.planningNotes = Objects.requireNonNull(planningNotes, "planningNotes is null");
+        this.refreshByTable = Map.copyOf(refreshByTable);
     }
 
-    public static Connector wrap(Connector delegate, String partitionColumn, InMemorySliceStore sliceStore) {
+    public static Connector wrap(
+            Connector delegate,
+            Map<String, List<String>> partitionColumnsByTable,
+            FileSliceStore sliceStore,
+            TableMetadataCache metadataCache,
+            PlanningNotes planningNotes,
+            Map<String, Duration> refreshByTable) {
         return (Connector) Proxy.newProxyInstance(
                 Connector.class.getClassLoader(),
                 new Class<?>[] {Connector.class},
-                new CachingConnector(delegate, partitionColumn, sliceStore));
+                new CachingConnector(delegate, partitionColumnsByTable, sliceStore, metadataCache, planningNotes, refreshByTable));
     }
 
     @Override
@@ -49,8 +71,8 @@ public final class CachingConnector implements InvocationHandler {
 
     private Object wrapResult(Method method, Object result) {
         return switch (method.getName()) {
-            case "getMetadata" -> CachingMetadata.wrap((ConnectorMetadata) result, partitionColumn, sliceStore.isParquetEnabled());
-            case "getSplitManager" -> new CachingSplitManager((ConnectorSplitManager) result);
+            case "getMetadata" -> CachingMetadata.wrap((ConnectorMetadata) result, partitionColumnsByTable, sliceStore.isEnabled(), metadataCache, planningNotes, refreshByTable);
+            case "getSplitManager" -> new OutageSafeSplitManager(new CachingSplitManager((ConnectorSplitManager) result));
             case "getPageSourceProvider" -> new CachingPageSourceProvider((ConnectorPageSourceProvider) result, sliceStore);
             case "getPageSourceProviderFactory" -> {ConnectorPageSourceProviderFactory factory = (ConnectorPageSourceProviderFactory) result;
                 yield (ConnectorPageSourceProviderFactory) () ->

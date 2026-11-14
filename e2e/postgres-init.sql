@@ -44,3 +44,14 @@ CROSS JOIN generate_series(0, 99) AS g
 WHERE true
 ON CONFLICT (region, day) DO UPDATE
 SET target = EXCLUDED.target;
+
+-- Deliberately NOT configured for caching in scent.properties (T16 opt-in check)
+CREATE TABLE IF NOT EXISTS notes (
+    id int PRIMARY KEY,
+    payload varchar NOT NULL
+);
+
+INSERT INTO notes (id, payload)
+VALUES (1, 'hello'), (2, 'world')
+ON CONFLICT (id) DO UPDATE
+SET payload = EXCLUDED.payload;

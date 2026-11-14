@@ -4,6 +4,7 @@ import io.trino.spi.Plugin;
 import io.trino.spi.connector.ConnectorFactory;
 
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Resolves a delegate {@link ConnectorFactory} by connector name.
@@ -16,10 +17,19 @@ public class DelegateConnectorResolver {
 
     private static final Map<String, String> DELEGATE_PLUGINS = Map.of(
             "postgresql", "io.trino.plugin.postgresql.PostgreSqlPlugin",
-            "oracle", "io.trino.plugin.oracle.OraclePlugin",
-            "bigquery", "io.trino.plugin.bigquery.BigQueryPlugin");
+            "oracle", "io.trino.plugin.oracle.OraclePlugin");
+
+    // Multi-split delegates are unsafe with the current one-slice-per-partition cache key: every
+    // delegate split would return the full slice on a hit (duplicate rows) and clobber the file on
+    // a miss. Gate until slices are keyed per delegate split (ADR-012).
+    private static final Set<String> MULTI_SPLIT_DELEGATES = Set.of("bigquery");
 
     public ConnectorFactory resolve(String name) {
+        if (MULTI_SPLIT_DELEGATES.contains(name)) {
+            throw new IllegalArgumentException(
+                    "Delegate connector '" + name + "' is not supported yet: it emits multiple splits per scan, "
+                            + "which SCENT's one-slice-per-partition cache key cannot cache safely (duplicate rows).");
+        }
         String pluginClassName = DELEGATE_PLUGINS.get(name);
         if (pluginClassName == null) {
             throw new IllegalArgumentException("Unsupported delegate connector: " + name);
