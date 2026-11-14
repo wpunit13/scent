@@ -259,6 +259,7 @@ Notes on non-obvious implementation constraints:
 * **Serialization.** `CachingTableHandle` and `CachingSplit` ride the coordinator-worker wire through the engine's typed Jackson module. `CachingTableHandle` must keep exactly one `@JsonCreator` constructor — two annotated creators fail every task update with conflicting-creator errors. The trust flag rides the same wire as a handle property.
 * **Delegate object persistence.** Planning notes store delegate objects as `{type, json}` envelopes deserialized through their own class; a polymorphic mapper misreads their delegating creators (proven with a real `JdbcTableHandle`). The JDBC handle keeps only its plain relation shape in the note, and schema columns are stored as SQL type strings rebuilt through the `TypeManager`.
 * **Classloader.** The delegate plugin class is resolved reflectively at runtime because the wrapper's classloader cannot see separately installed plugin directories; the delegate jars are copied into the wrapper's directory at deploy time (§4).
+* **Module layout (target, ADR-016).** The eventual structure is `connector-core` + `connector-spi-<min>`, with `trino.version` as a build parameter and the supported range derived from the folder name (no version→module map). See `docs/DEVELOPMENT.md`.
 
 ---
 

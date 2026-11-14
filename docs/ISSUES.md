@@ -358,6 +358,25 @@ treatment #8 applied to columns.
 - The BigQuery gate in `DelegateConnectorResolver` is removed.
 - Populate/hit logic is unchanged; only the key (and therefore the file identity) differs.
 
+### ADR-016 — Module layout and release matrix: convention over map
+
+**Status:** accepted (2026-11-14)
+
+**Context:** The plugin must track Trino's SPI across many releases while shipping its own functional and
+security changes independently. A central `version → module` map (or one source module per Trino version) was
+considered and rejected: a map is a second source of truth that drifts, and per-version modules duplicate a
+thin adapter N times.
+
+**Decision:** Split the plugin into `connector-core` (SPI-free business logic) and `connector-spi` (the thin
+adapter). `trino.version` is a build parameter, not a source folder. The SPI module is named
+`connector-spi-<min>` where `<min>` is the first Trino version it compiles against; the supported range is
+derived from the folder names, not stored. A new module is created only on a non-additive SPI change. The
+support window is the latest 6 Trino versions.
+
+**Consequences:** The operating rules (derivation, runbook, deprecation, anti-patterns) live in
+`docs/DEVELOPMENT.md`, which is the permanent guideline. The single source of truth is the folder naming
+convention plus two constants (`LATEST_SUPPORTED_TRINO`, `SUPPORT_WINDOW_SIZE`).
+
 ---
 
 ## Design: the raw-slice problem (C1/C2/C3)
@@ -510,3 +529,4 @@ Cold slice + concurrent queries = thundering herd. Two flavors:
 | 2026-10-04 | Column layout fixed by sorted column names (`cachedChannelOrder`) | Map iteration order is not deterministic across transactions; sorted keys keep the cached page layout identical for hits and populate reads |
 | 2026-10-04 | applyFilter bails to uncached when the delegate partially applied the partition constraint | Cached slices assume the delegate applied the partition predicate fully; merging delegate leftovers deferred |
 | 2026-11-10 | ADR-015: cache key gains a per-split dimension (`split` = SHA-256 of delegate split `toString`); restores ADR-004's `[table, sliceId, bucket, version]` and ADR-008's non-table-format scope; removes the BigQuery gate | Multi-split delegates shared one partition key → duplicate rows on hit, clobber on miss; BigQuery record `toString` is deterministic and injective via `streamName`; SHA-256 keeps filenames bounded |
+| 2026-11-14 | ADR-016: module layout = `connector-core` + `connector-spi-<min>`; `trino.version` is a build parameter; support window is latest 6; no version→module map (folder name is the contract) | A map is a second source of truth that drifts; per-version modules duplicate a thin adapter N times; the range is derived from folder names |
